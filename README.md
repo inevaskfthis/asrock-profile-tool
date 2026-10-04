@@ -366,9 +366,10 @@ Windows 的 cmd/PowerShell 默认代码页是 **cp936(GBK)**，而 `⚠ ✔ ✘ 
 
 ```
 asrock_profile.py    主程序 —— CLI + GUI 同一个文件（纯标准库）
-selftest.py          冒烟测试：CLI、板型警告、数值自检、detect、GUI、GBK 编码回归
+selftest.py          冒烟测试：CLI、板型警告、数值自检、detect、i18n、GUI、GBK 回归
 build.py             一键 PyInstaller 打包
 HOW-IT-WORKS.md      **实现原理**：为什么菜单里没有却仍有效、为什么读回来这么难判
+analysis/            当初逆向用的分析脚本 + 它们的教训（跑它们要额外的 BIOS 镜像）
 README.md            本文件（中英双语）
 LICENSE              MIT © inevaskfthis
 ```
@@ -758,9 +759,10 @@ platform, and what has **already been handled**.
 
 ```
 asrock_profile.py    main program — CLI + GUI in one file (stdlib only)
-selftest.py          smoke tests: CLI, board warnings, sanity check, detect, GUI, GBK regression
+selftest.py          smoke tests: CLI, board warnings, sanity check, detect, i18n, GUI, GBK regression
 build.py             one-command PyInstaller packaging
 HOW-IT-WORKS.md      **implementation notes** — why a hidden field still works, why detection is hard
+analysis/            the reverse-engineering scripts behind the field table, and their lessons
 README.md            this file (bilingual)
 LICENSE              MIT © inevaskfthis
 ```
