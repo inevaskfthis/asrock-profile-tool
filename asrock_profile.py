@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-asrock_profile.py — ASRock BIOS 用户配置档案（U 盘档案）编辑器  [CLI + GUI 二合一]
+"""asrock_profile.py — ASRock BIOS 用户配置档案（U 盘档案）编辑器  [纯命令行]
 
 在 ASRock 主板上，BIOS 提供 "Save User Default to USB flash drive" /
 "Load User Default from USB flash drive"。导出的档案里嵌着一整份
@@ -13,12 +12,15 @@ UEFI Setup 变量的原样副本；载入档案时由固件自己把它写回活
 ⚠️ 重要：本工具**不会**让 BIOS 菜单里多出条目。菜单里有没有某个选项由
        Setup 模块的 IFR 决定，跟本档案无关。改档只能改「值」，不能加「条目」。
 
-启动方式
---------
-    无参数 / 双击 / --gui     → 图形界面
-    带子命令（info/set/...）   → 命令行模式
+怎么用
+------
+    asrock_profile info  <档案>       看档案信息和当前值
+    asrock_profile get  <档案> <字段>  读单个字段
+    asrock_profile set  <档案> --llc 3 改字段并写出新档案
+    asrock_profile detect <镜像>       看当前生效的 CPU LLC 是几级
+    asrock_profile -h                 完整帮助
 
-用法见 README.md，或 `asrock_profile -h`。
+把档案直接拖到 exe 上也可以 —— 等价于 `asrock_profile info <档案>`。
 
 License: MIT
 Author:  inevaskfthis
@@ -1236,763 +1238,6 @@ def cmd_boards(args):
     return 0
 
 
-#: 各平台优先使用的界面字体。
-#: ⚠ 这个界面**全是中文** —— 如果挑不到带 CJK 字形的字体，Linux 上会整片显示成
-#:   豆腐块（□□□）。Tk 对不存在的字体名是"静默回退"，不会报错，所以必须
-#:   拿 tkinter.font.families() 逐个核对，不能直接写死名字。
-UI_FONT_PREFS = {
-    "win32":  ["Microsoft YaHei UI", "Microsoft YaHei", "SimHei", "SimSun", "Segoe UI"],
-    "darwin": ["PingFang SC", "Hiragino Sans GB", "Heiti SC", "STHeiti", "Helvetica Neue"],
-    "linux":  ["Noto Sans CJK SC", "Source Han Sans SC", "WenQuanYi Micro Hei",
-               "WenQuanYi Zen Hei", "Droid Sans Fallback", "DejaVu Sans"],
-}
-
-#: 等宽字体（用于信息面板 / 日志 / 表格里的十六进制）
-MONO_FONT_PREFS = {
-    "win32":  ["Consolas", "Cascadia Mono", "Courier New"],
-    "darwin": ["Menlo", "Monaco", "Courier New"],
-    "linux":  ["DejaVu Sans Mono", "Liberation Mono", "Noto Sans Mono", "Courier New"],
-}
-
-
-def plat_key() -> str:
-    """把 sys.platform 归成三档（其余一律当 linux 处理，含 BSD）。"""
-    if sys.platform == "win32":
-        return "win32"
-    if sys.platform == "darwin":
-        return "darwin"
-    return "linux"
-
-
-def pick_font(available, prefs, fallback):
-    """从候选里挑第一个系统真有的字体。"""
-    low = {str(f).lower() for f in available}
-    for name in prefs:
-        if name.lower() in low:
-            return name
-    return fallback
-
-
-def screen_size(root):
-    """取屏幕尺寸；个别环境下 winfo_* 会抛异常，兜一层。"""
-    try:
-        return int(root.winfo_screenwidth()), int(root.winfo_screenheight())
-    except Exception:
-        return 1280, 800
-
-# --------------------------------------------------------------------------- #
-# GUI
-# --------------------------------------------------------------------------- #
-
-def gui_available() -> bool:
-    try:
-        import tkinter                                     # noqa: F401
-        return True
-    except Exception:
-        return False
-
-
-def _dpi_aware():
-    if sys.platform != "win32":
-        return
-    try:
-        import ctypes
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
-
-
-def _hide_console():
-    """把控制台窗口藏起来（备用，默认不用）。
-
-    打包成控制台子系统 exe 后，双击 GUI 会带一个黑框 —— 这是刻意的：
-    CLI 模式必须有 stdout，而一个 exe 只能有一个子系统。
-    真想要无黑框的话，在 `run_gui(hide_console=True)` 里调它即可。
-    """
-    if sys.platform != "win32":
-        return
-    try:
-        import ctypes
-        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-        if hwnd:
-            ctypes.windll.user32.ShowWindow(hwnd, 0)       # SW_HIDE
-    except Exception:
-        pass
-
-
-class ProfileGUI:
-    """图形界面。全部业务逻辑都复用上面的 Profile / build_plan / _report_and_write。"""
-
-    # 「不改」的哨兵文本走模块级 no_change_text()：类体是导入时求值的，
-    # 写成类属性会把语言固化在启动那一刻。
-
-    def __init__(self, root, initial=None):
-        import tkinter as tk
-        from tkinter import ttk, filedialog, messagebox
-        self.tk = tk
-        self.ttk = ttk
-        self.filedialog = filedialog
-        self.messagebox = messagebox
-
-        self.root = root
-        self.path = None
-        self.p = None
-        self.pending = []          # [(offset, value), ...]
-
-
-        # ---- 主题：win=vista / mac=aqua / 其它=clam ----
-        self.C_OK = "#1B7F3B"
-        self.C_WARN = "#B00020"
-        style = ttk.Style()
-        try:
-            style.theme_use({"win32": "vista", "darwin": "aqua",
-                             "linux": "clam"}[plat_key()])
-        except Exception:
-            pass
-        style.configure("Warn.TLabel", foreground=self.C_WARN)
-        style.configure("Ok.TLabel", foreground=self.C_OK)
-
-        # ---- 字体：必须挑到带 CJK 字形的，否则 Linux 上整片豆腐块 ----
-        from tkinter import font as tkfont
-        try:
-            fams = set(tkfont.families(root))
-        except Exception:
-            fams = set()
-        ui_font = pick_font(fams, UI_FONT_PREFS[plat_key()], None)
-        mono_font = pick_font(fams, MONO_FONT_PREFS[plat_key()], None)
-        self.f_mono = (mono_font, 9) if mono_font else "TkFixedFont"
-        if ui_font:
-            try:
-                style.configure(".", font=(ui_font, 10))
-            except Exception:
-                pass
-
-        # ---- 窗口尺寸：不能超出屏幕（小屏笔记本 + HiDPI 缩放下很容易超） ----
-        sw, sh = screen_size(root)
-        w = min(980, max(640, sw - 100))
-        h = min(940, max(520, sh - 140))
-        root.geometry("%dx%d+%d+%d" % (w, h, max(0, (sw - w) // 2), max(0, (sh - h) // 3)))
-        root.minsize(min(820, w), min(680, h))
-
-        self.outer = None
-        self.baseline_path = None
-        self._build_all(initial)
-
-    # -- 构建 / 重建（切语言时整棵控件树重建） -------------------------------- #
-
-    def _build_all(self, initial=None):
-        """建出全部控件。切换语言时也是走这里（先 destroy 再重来）。"""
-        ttk = self.ttk
-        self.root.title(T(T("ASRock 配置档案编辑器  ·  asrock_profile %s")) % __version__)
-        self.outer = ttk.Frame(self.root, padding=10)
-        self.outer.pack(fill="both", expand=True)
-
-        self._build_lang_row(self.outer)
-        self._build_file_box(self.outer)
-        self._build_info_box(self.outer)
-        self._build_detect_box(self.outer)
-        self._build_field_box(self.outer)
-        self._build_edit_box(self.outer)
-        self._build_output_box(self.outer)
-        self._build_log_box(self.outer)
-
-        self._refresh_all()
-        if initial:
-            self.load_file(initial)
-
-    def _build_lang_row(self, parent):
-        tk, ttk = self.tk, self.ttk
-        row = ttk.Frame(parent)
-        row.pack(fill="x", pady=(0, 6))
-        ttk.Label(row, text=T(T("界面语言"))).pack(side="left")
-        self.v_lang = tk.StringVar(value=lang_name(get_lang()))
-        cb = ttk.Combobox(row, textvariable=self.v_lang, state="readonly",
-                          width=9, values=[lang_name(c) for c in LANGS])
-        cb.pack(side="left", padx=(6, 0))
-        cb.bind("<<ComboboxSelected>>", self.on_lang_change)
-        ttk.Label(row, text=T(T("切换后界面立刻重建，已载入的档案、待改动与日志都会保留"))
-                  ).pack(side="left", padx=(10, 0))
-
-    def on_lang_change(self, _evt=None):
-        want = LANG_EN if self.v_lang.get() == "English" else LANG_ZH
-        if want == get_lang():
-            return
-        set_lang(want)
-        self.rebuild()
-
-    def rebuild(self):
-        """重建界面（换语言用）。
-
-        Tk 没有「统一重设所有控件文本」的入口，逐个改反而容易漏；
-        直接销毁控件树重建、再把状态灌回去，最省心也最不容易出错。
-        """
-        st = {
-            "path": self.v_path.get(),
-            "spi": self.v_spi.get(),
-            "out": self.v_out.get(),
-            "inplace": bool(self.v_inplace.get()),
-            "dryrun": bool(self.v_dryrun.get()),
-            "off": self.v_off.get(),
-            "val": self.v_val.get(),
-            "llc": self._llc_num(self.v_llc.get()),
-            "soc": self._llc_num(self.v_socllc.get()),
-            "pending": list(self.pending),
-            "baseline": self.baseline_path,
-            "detected": bool(self.lbl_detect.cget("text")),
-        }
-        self.outer.destroy()
-        self._build_all()
-
-        self.baseline_path = st["baseline"]
-        self.pending = st["pending"]
-        self.v_path.set(st["path"])
-        self.v_spi.set(st["spi"])
-        self.v_out.set(st["out"])
-        self.v_inplace.set(st["inplace"])
-        self.v_dryrun.set(st["dryrun"])
-        self.v_off.set(st["off"])
-        self.v_val.set(st["val"])
-        self._set_llc(self.v_llc, st["llc"])
-        self._set_llc(self.v_socllc, st["soc"])
-
-        # 日志与检测结论都是「用旧语言渲染好的**文本**」，原样搬过来必然中英混排
-        # ⇒ 不复用文本，改按语义重放：载入 → 待改动 → 检测。
-        # 代价：切换前日志里的其它行（比如"已写出 xxx"）不会回来 —— 日志本来就
-        # 是即时视图不是档案，这样换语言的观感更干净。
-        self.log_clear()
-        if st["path"] and os.path.exists(st["path"]):
-            self.load_file(st["path"])          # 会重写「载入 + 板型警告」（新语言）
-            self.pending = st["pending"]
-        for off, val in self.pending:
-            self.log(T("加入改动：Setup+0x%03X %s = %s")
-                     % (off, self.p.describe_field(off) if self.p else "",
-                        _fmt_value(off, val)))
-        self._refresh_all()
-        if st["detected"] and self.v_spi.get().strip():
-            self.on_detect()                    # 重跑检测：日志与结论一起换语言
-
-    def _set_llc(self, var, num):
-        """把下拉框设成档位 num（None = 哨兵）。"""
-        var.set(no_change_text() if num is None
-                else "%s (%d)" % (LLC_OPTIONS[num], num))
-
-    # -- 布局 --------------------------------------------------------------- #
-
-    def _build_file_box(self, parent):
-        tk, ttk = self.tk, self.ttk
-        box = ttk.LabelFrame(parent, text=T(" 1. 档案 "), padding=8)
-        box.pack(fill="x")
-        self.v_path = tk.StringVar()
-        e = ttk.Entry(box, textvariable=self.v_path)
-        e.pack(side="left", fill="x", expand=True)
-        ttk.Button(box, text=T("打开档案…"), command=self.on_browse).pack(side="left", padx=(6, 0))
-        ttk.Button(box, text=T("重新载入"), command=self.on_reload).pack(side="left", padx=(6, 0))
-
-    def _build_info_box(self, parent):
-        tk, ttk = self.tk, self.ttk
-        box = ttk.LabelFrame(parent, text=T(" 2. 档案信息与检查 "), padding=8)
-        box.pack(fill="x", pady=(8, 0))
-        self.txt_info = tk.Text(box, height=7, wrap="none", state="disabled",
-                                font=self.f_mono)
-        self.txt_info.pack(fill="x")
-        # 用 tk.Label 而不是 ttk.Label：macOS 的 aqua 主题会忽略 ttk 的 foreground，
-        # 红字告警会变成黑色。经典 Label 在所有平台都老老实实听 fg=。
-        self.lbl_warn = tk.Label(box, text="", fg=self.C_WARN, anchor="w",
-                                 justify="left", wraplength=860)
-        self.lbl_warn.pack(fill="x", pady=(6, 0))
-
-    def _build_detect_box(self, parent):
-        tk, ttk = self.tk, self.ttk
-        box = ttk.LabelFrame(
-            parent,
-            text=T(" 3. 检测当前状态（读整片 SPI 镜像，例如 AFU 备份出来的 r5.bin）"),
-            padding=8)
-        box.pack(fill="x", pady=(8, 0))
-
-        row = ttk.Frame(box)
-        row.pack(fill="x")
-        self.v_spi = tk.StringVar()
-        ttk.Entry(row, textvariable=self.v_spi).pack(side="left", fill="x",
-                                                     expand=True)
-        ttk.Button(row, text=T("选择镜像…"), command=self.on_pick_spi).pack(
-            side="left", padx=(6, 0))
-        ttk.Button(row, text=T("检测"), command=self.on_detect).pack(
-            side="left", padx=(6, 0))
-        ttk.Button(row, text=T("用作基线"), command=self.on_use_baseline).pack(
-            side="left", padx=(6, 0))
-
-        self.lbl_detect = tk.Label(box, text=T("（未检测）"), anchor="w",
-                                   justify="left", wraplength=880)
-        self.lbl_detect.pack(fill="x", pady=(6, 0))
-        # baseline_path 由 __init__ 初始化；重建界面时不能在这里清掉。
-
-    # -- 检测 --------------------------------------------------------------- #
-
-    def on_pick_spi(self):
-        p = self.filedialog.askopenfilename(
-            title=T("选择整片 SPI 镜像（AFU 的 /O 备份产物）"),
-            filetypes=[(T("BIN 镜像"), "*.bin"), (T("所有文件"), "*.*")])
-        if p:
-            self.v_spi.set(p)
-
-    def on_use_baseline(self):
-        if not self.v_spi.get().strip():
-            self.messagebox.showwarning(T("未选择镜像"), T("请先选择一个 SPI 镜像。"))
-            return
-        self.baseline_path = self.v_spi.get().strip()
-        self.log(T("已把 %s 记为基线（下次检测会做基线对照，判定 100%% 确定）")
-                 % self.baseline_path)
-
-    def on_detect(self):
-        path = self.v_spi.get().strip()
-        if not path:
-            self.messagebox.showwarning(
-                T("未选择镜像"),
-                T("请先选择一张整片 SPI 镜像（用 AFU 的 /O 备份出来的 .bin）。\n"
-                "也可以直接选一份 U 盘配置档案，但那样只能看到档案里的值。"))
-            return
-        try:
-            lines, verdict = detect_lines(path, self.baseline_path, self.path)
-        except ProfileError as e:
-            self.messagebox.showerror(T("检测失败"), str(e))
-            self.log(T("✘ 检测失败: %s") % e)
-            return
-        except (OSError, ValueError) as e:
-            self.messagebox.showerror(T("检测失败"), str(e))
-            return
-
-        self.log_clear()
-        self.log("\n".join(lines))
-
-        # 只看符号，不看词 —— 词是会被翻译的
-        color = self.C_WARN if "✘" in verdict else self.C_OK
-        self.lbl_detect.configure(text="⇒ " + verdict, fg=color)
-        if self.p is not None:
-            self.log(T("\n（上面同时与当前打开的档案 %s 做了比对）")
-                     % os.path.basename(self.path))
-
-    def _build_field_box(self, parent):
-        ttk = self.ttk
-        box = ttk.LabelFrame(parent, text=T(" 4. 已知字段当前值（只读，供核对偏移表是否匹配）"),
-                             padding=8)
-        box.pack(fill="both", expand=False, pady=(8, 0))
-        cols = ("off", "name", "value")
-        tv = ttk.Treeview(box, columns=cols, show="headings", height=6)
-        tv.heading("off", text=T("Setup 偏移"))
-        tv.heading("name", text=T("字段"))
-        tv.heading("value", text=T("当前值"))
-        tv.column("off", width=110, anchor="w", stretch=False)
-        tv.column("name", width=430, anchor="w")
-        tv.column("value", width=150, anchor="w", stretch=False)
-        sb = ttk.Scrollbar(box, orient="vertical", command=tv.yview)
-        tv.configure(yscrollcommand=sb.set)
-        tv.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        self.tree_fields = tv
-
-    def _build_edit_box(self, parent):
-        tk, ttk = self.tk, self.ttk
-        box = ttk.LabelFrame(parent, text=T(" 5. 修改 "), padding=8)
-        box.pack(fill="both", expand=False, pady=(8, 0))
-
-        grid = ttk.Frame(box)
-        grid.pack(fill="x")
-
-        ttk.Label(grid, text="CPU Load-Line Calibration (Setup+0x190)").grid(
-            row=0, column=0, sticky="w", pady=2)
-        self.v_llc = tk.StringVar(value=no_change_text())
-        self.cb_llc = ttk.Combobox(grid, textvariable=self.v_llc, state="readonly",
-                                   width=18, values=self._llc_values())
-        self.cb_llc.grid(row=0, column=1, sticky="w", padx=(10, 0), pady=2)
-
-        ttk.Label(grid, text="VDDCR_SOC Load-Line Calibration (Setup+0x191)").grid(
-            row=1, column=0, sticky="w", pady=2)
-        self.v_socllc = tk.StringVar(value=no_change_text())
-        ttk.Combobox(grid, textvariable=self.v_socllc, state="readonly",
-                     width=18, values=self._llc_values()).grid(
-            row=1, column=1, sticky="w", padx=(10, 0), pady=2)
-
-        ttk.Label(grid, text=T("自定义字节（偏移支持别名或十六进制，如 0x1B1）")).grid(
-            row=2, column=0, sticky="w", pady=(8, 2))
-        sub = ttk.Frame(grid)
-        sub.grid(row=2, column=1, sticky="w", padx=(10, 0), pady=(8, 2))
-        self.v_off = tk.StringVar()
-        self.v_val = tk.StringVar()
-        ttk.Entry(sub, textvariable=self.v_off, width=14).pack(side="left")
-        ttk.Label(sub, text="=").pack(side="left", padx=3)
-        ttk.Entry(sub, textvariable=self.v_val, width=8).pack(side="left")
-        ttk.Button(sub, text=T("添加"), width=6, command=self.on_add_pending).pack(
-            side="left", padx=(6, 0))
-        ttk.Button(sub, text=T("删除选中"), width=9, command=self.on_del_pending).pack(
-            side="left", padx=(6, 0))
-
-        cols = ("off", "name", "old", "new")
-        tv = ttk.Treeview(box, columns=cols, show="headings", height=5)
-        for c, t, w in (("off", T("Setup 偏移"), 100), ("name", T("字段"), 320),
-                        ("old", T("原值"), 90), ("new", T("新值"), 90)):
-            tv.heading(c, text=t)
-            tv.column(c, width=w, anchor="w", stretch=(c == "name"))
-        tv.pack(fill="x", pady=(8, 0))
-        self.tree_pending = tv
-
-    def _build_output_box(self, parent):
-        tk, ttk = self.tk, self.ttk
-        box = ttk.LabelFrame(parent, text=T(" 6. 输出 "), padding=8)
-        box.pack(fill="x", pady=(8, 0))
-        row = ttk.Frame(box)
-        row.pack(fill="x")
-        ttk.Label(row, text=T("输出文件")).pack(side="left")
-        self.v_out = tk.StringVar()
-        ttk.Entry(row, textvariable=self.v_out).pack(side="left", fill="x",
-                                                     expand=True, padx=(6, 6))
-        ttk.Button(row, text=T("另存为…"), command=self.on_pick_out).pack(side="left")
-
-        row2 = ttk.Frame(box)
-        row2.pack(fill="x", pady=(6, 0))
-        self.v_inplace = tk.BooleanVar(value=False)
-        self.v_dryrun = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row2, text=T("覆盖原文件（建议先备份）"),
-                        variable=self.v_inplace).pack(side="left")
-        ttk.Checkbutton(row2, text=T("仅预览（不写文件）"),
-                        variable=self.v_dryrun).pack(side="left", padx=(14, 0))
-
-        row3 = ttk.Frame(box)
-        row3.pack(fill="x", pady=(8, 0))
-        self.btn_apply = ttk.Button(row3, text=T("应用并写出"), command=self.on_apply)
-        self.btn_apply.pack(side="left")
-        ttk.Button(row3, text=T("清空改动"), command=self.on_clear_pending).pack(
-            side="left", padx=(6, 0))
-        ttk.Button(row3, text=T("打开输出目录"), command=self.on_open_dir).pack(
-            side="left", padx=(6, 0))
-
-    def _build_log_box(self, parent):
-        tk, ttk = self.tk, self.ttk
-        box = ttk.LabelFrame(parent, text=T(" 7. 日志 "), padding=8)
-        box.pack(fill="both", expand=True, pady=(8, 0))
-        self.txt_log = tk.Text(box, height=9, wrap="none", state="disabled",
-                               font=self.f_mono)
-        sb = ttk.Scrollbar(box, orient="vertical", command=self.txt_log.yview)
-        self.txt_log.configure(yscrollcommand=sb.set)
-        self.txt_log.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-
-    @staticmethod
-    def _llc_values():
-        return [no_change_text()] + ["%s (%d)" % (v, k) for k, v in sorted(LLC_OPTIONS.items())]
-
-    # -- 日志 --------------------------------------------------------------- #
-
-    def log(self, text=""):
-        self.txt_log.configure(state="normal")
-        self.txt_log.insert("end", text + "\n")
-        self.txt_log.see("end")
-        self.txt_log.configure(state="disabled")
-
-    def log_clear(self):
-        self.txt_log.configure(state="normal")
-        self.txt_log.delete("1.0", "end")
-        self.txt_log.configure(state="disabled")
-
-    def _set_info_text(self, text):
-        self.txt_info.configure(state="normal")
-        self.txt_info.delete("1.0", "end")
-        self.txt_info.insert("1.0", text)
-        self.txt_info.configure(state="disabled")
-
-    # -- 载入 --------------------------------------------------------------- #
-
-    def on_browse(self):
-        p = self.filedialog.askopenfilename(
-            title=T("选择 ASRock 配置档案"),
-            filetypes=[(T("所有文件"), "*.*")])
-        if p:
-            self.load_file(p)
-
-    def on_reload(self):
-        if self.path:
-            self.load_file(self.path)
-
-    def load_file(self, path):
-        try:
-            prof = load(path)
-        except ProfileError as e:
-            self.messagebox.showerror(T("无法解析档案"), str(e))
-            self.log(T("✘ 载入失败：%s") % e)
-            return
-        except FileNotFoundError:
-            self.messagebox.showerror(T("找不到文件"), path)
-            return
-        except OSError as e:
-            self.messagebox.showerror(T("读取失败"), str(e))
-            return
-
-        self.p = prof
-        self.path = path
-        self.v_path.set(path)
-        if not self.v_out.get() or self.v_out.get().endswith(".mod"):
-            self.v_out.set(path + ".mod")
-
-        self.pending = []
-        self._refresh_all()
-
-        warns = board_warnings(prof)
-        self.log(T("载入: %s（%d 字节，Setup @0x%X size=0x%X）")
-                 % (os.path.abspath(path), len(prof.data), prof.setup_off, prof.setup_size))
-        for lv, msg in warns:
-            self.log(("⚠ " if lv == WARN else "✘ ") + msg.replace("\n", "\n  ").replace("    ", "  "))
-        if not warns:
-            self.log(T("✔ 板型 / 版本 / 字段自检：全部通过"))
-
-    def _refresh_info(self):
-        if not self.p:
-            self._set_info_text("")
-            # tk.Label 没有 -style 选项（那是 ttk 的），写它会抛 TclError
-            self.lbl_warn.configure(text="", fg=self.C_OK)
-            return
-        lines = info_lines(self.p, self.path)
-        self._set_info_text("\n".join(lines))
-
-        warns = board_warnings(self.p)
-        if not warns:
-            self.lbl_warn.configure(text=T("✔ 板型、BIOS 版本与字段自检均通过。"),
-                                    fg=self.C_OK)
-        else:
-            txt = "\n".join(("⚠ " if lv == WARN else "✘ ") + msg for lv, msg in warns)
-            self.lbl_warn.configure(text=txt, fg=self.C_WARN)
-
-    def _refresh_fields(self):
-        tv = self.tree_fields
-        tv.delete(*tv.get_children())
-        if not self.p:
-            return
-        for off, size, kind, name in KNOWN_FIELDS:
-            if off + size > self.p.setup_size:
-                continue
-            v = self.p.get_field(off, size)
-            tv.insert("", "end", values=("0x%03X" % off, name,
-                                         _fmt_value(off, v) if size == 1 else str(v)))
-
-    def _refresh_pending(self):
-        tv = self.tree_pending
-        tv.delete(*tv.get_children())
-        for off, val in self.pending:
-            old = self.p.get_field(off, 1) if self.p else 0
-            tv.insert("", "end", iid="0x%X" % off,
-                      values=("0x%03X" % off, self.p.describe_field(off) if self.p else "",
-                              _fmt_value(off, old), _fmt_value(off, val)))
-
-    def _refresh_all(self):
-        self._refresh_info()
-        self._refresh_fields()
-        self._refresh_pending()
-
-    # -- 编辑 --------------------------------------------------------------- #
-
-    @staticmethod
-    def _llc_num(s):
-        """从下拉框显示文本里取档位号；哨兵文本返回 None。
-
-        刻意不拿「不改」那句译文来比较 —— 换了语言旧值就认不出来了。
-        也不能假设「哨兵不含括号」：中文哨兵本身写作 `(不改)`，
-        所以解析失败一律当哨兵处理，别让它抛出去。
-        """
-        if not s or "(" not in s:
-            return None
-        try:
-            return int(s.rsplit("(", 1)[1].rstrip(")"))
-        except ValueError:
-            return None
-
-    def on_add_pending(self):
-        if not self.p:
-            self.messagebox.showwarning(T("还没有载入档案"), T("请先打开一个配置档案。"))
-            return
-        spec = self.v_off.get().strip()
-        raw = self.v_val.get().strip()
-        if not spec or not raw:
-            self.messagebox.showwarning(T("输入不完整"), T("请同时填写偏移和值。"))
-            return
-        try:
-            off = _resolve_target(spec)
-            val = int(raw, 0)
-        except ProfileError as e:
-            self.messagebox.showerror(T("无法识别"), str(e))
-            return
-        except ValueError:
-            self.messagebox.showerror(T("值不合法"), T("值可以是十进制或 0x 开头的十六进制。"))
-            return
-        try:
-            _check_off_spec(self.p, off)
-        except ProfileError as e:
-            self.messagebox.showerror(T("偏移越界"), str(e))
-            return
-        if not 0 <= val <= 0xFF:
-            self.messagebox.showerror(T("值越界"), T("字节值必须在 0..255。"))
-            return
-        self.pending = [x for x in self.pending if x[0] != off]
-        self.pending.append((off, val))
-        self.v_off.set("")
-        self.v_val.set("")
-        self._refresh_pending()
-        self.log(T("加入改动：Setup+0x%03X %s = %s")
-                 % (off, self.p.describe_field(off), _fmt_value(off, val)))
-
-    def on_del_pending(self):
-        sel = self.tree_pending.selection()
-        if not sel:
-            return
-        drop = {int(s, 16) for s in sel}
-        self.pending = [x for x in self.pending if x[0] not in drop]
-        self._refresh_pending()
-
-    def on_clear_pending(self):
-        self.pending = []
-        self.v_llc.set(no_change_text())
-        self.v_socllc.set(no_change_text())
-        self._refresh_pending()
-        self.log(T("已清空待改动列表"))
-
-    def on_pick_out(self):
-        p = self.filedialog.asksaveasfilename(
-            title=T("输出档案另存为"),
-            initialfile=os.path.basename(self.v_out.get()) or "profile.mod")
-        if p:
-            self.v_out.set(p)
-
-    def on_open_dir(self):
-        target = self.v_out.get() or self.path
-        if not target:
-            return
-        d = os.path.dirname(os.path.abspath(target))
-        try:
-            if sys.platform == "win32":
-                os.startfile(d)                            # noqa: S606
-            elif sys.platform == "darwin":
-                subprocess.Popen(["open", d])              # 传 list，路径含空格也不用管
-            else:
-                subprocess.Popen(["xdg-open", d])
-        except Exception as e:
-            self.messagebox.showerror(T("打开失败"), str(e))
-
-    # -- 应用 --------------------------------------------------------------- #
-
-    def on_apply(self):
-        if not self.p:
-            self.messagebox.showwarning(T("还没有载入档案"), T("请先打开一个配置档案。"))
-            return
-
-        # 收集改动：下拉框 + 待改动列表
-        try:
-            llc = self._llc_num(self.v_llc.get())
-            soc = self._llc_num(self.v_socllc.get())
-        except Exception:
-            self.messagebox.showerror(T("解析失败"), T("下拉框取值异常，请重新选择。"))
-            return
-
-        raw = list(self.pending)
-        # 下拉框优先级高于列表里的同偏移项
-        for off in (0x190, 0x191):
-            raw = [x for x in raw if x[0] != off]
-        if llc is not None:
-            raw.append((0x190, llc))
-        if soc is not None:
-            raw.append((0x191, soc))
-
-        if not raw:
-            self.messagebox.showinfo(T("没有改动"), T("没有指定任何要修改的字段。"))
-            return
-
-        # 重新解析一份干净副本，避免上次失败残留
-        try:
-            prof = load(self.path)
-        except Exception as e:
-            self.messagebox.showerror(T("重新载入失败"), str(e))
-            return
-
-        # 板型警告 → 二次确认
-        warns = board_warnings(prof)
-        if warns:
-            txt = "\n\n".join(msg for lv, msg in warns)
-            if not self.messagebox.askyesno(
-                    T("⚠ 版型检查未通过"),
-                    txt + T("\n\n仍然要继续吗？\n（建议先取消，把 info 输出贴到 issue）"),
-                    icon="warning", default="no"):
-                self.log(T("用户取消了操作（版型警告）。"))
-                return
-
-        try:
-            plan = build_plan(prof, llc, soc, raw)
-            diffs = apply_plan(prof, plan, quiet=True)
-        except ProfileError as e:
-            self.messagebox.showerror(T("无法构造改动"), str(e))
-            return
-
-        if not diffs:
-            self.messagebox.showinfo(T("没有改动"), T("指定的值与当前值相同，无需写出。"))
-            self.log(T("没有实际改动。"))
-            return
-
-        args = argparse.Namespace(
-            file=self.path,
-            output=self.v_out.get() or None,
-            inplace=bool(self.v_inplace.get()),
-            dry_run=bool(self.v_dryrun.get()),
-        )
-
-        # 复用命令行那套报告/写出/自检逻辑，把输出抓进日志窗口
-        set_color(False)
-        buf = io.StringIO()
-        try:
-            with contextlib.redirect_stdout(buf):
-                out = _report_and_write(prof, args, diffs)
-        except (ProfileError, OSError) as e:
-            self.log_clear()
-            self.log("✘ " + str(e))
-            self.messagebox.showerror(T("写出失败"), str(e))
-            return
-        finally:
-            set_color(sys.stdout.isatty())
-
-        self.log_clear()
-        self.log(buf.getvalue().rstrip())
-        if args.dry_run:
-            self.log(T("\n（仅预览：未写出文件）"))
-        else:
-            self.log_clear()
-            self.log(buf.getvalue().rstrip())
-            self.messagebox.showinfo(
-                T("完成"),
-                T("已写出：\n%s\n\n请把它拷到 FAT32 U 盘根目录，"
-                "再进 BIOS 用 “Load User Default from USB flash drive” 载入。")
-                % os.path.abspath(out))
-            # 写出后把界面同步到输出文件，方便连续做多档位
-            if os.path.abspath(out) != os.path.abspath(self.path):
-                self.load_file(out)
-                self.log(T("界面已切换到新写出档案：%s") % out)
-
-
-def create_gui(root, initial=None):
-    """构建 GUI 并返回控制器（不进入 mainloop）。便于自动化测试。"""
-    return ProfileGUI(root, initial)
-
-
-def run_gui(paths=None, hide_console=False):
-    if not gui_available():
-        sys.stderr.write(T("错误: 无法加载 GUI（本机 Python 没带 tkinter）。\n"))
-        sys.stderr.write(T("请改用命令行模式，例如: %s info <档案>\n")
-                         % os.path.basename(sys.argv[0]))
-        return 1
-    import tkinter as tk
-    _dpi_aware()
-    if hide_console:
-        _hide_console()
-    set_color(False)
-    root = tk.Tk()
-    create_gui(root, paths[0] if paths else None)
-    root.mainloop()
-    return 0
-
-
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #
@@ -2012,10 +1257,9 @@ def build_parser():
     ap = argparse.ArgumentParser(
         prog="asrock_profile",
         description=T("ASRock BIOS 用户配置档案（U 盘档案）编辑器 —— "
-                    "用来修改档案里内嵌的 Setup 变量字节。"
-                    "  不带参数运行即打开图形界面。"),
+                    "用来修改档案里内嵌的 Setup 变量字节。"),
         epilog=T("示例:\n"
-               "  asrock_profile                              # 打开图形界面\n"
+               "  asrock_profile                              # 显示这份帮助\n"
                "  asrock_profile info pbo2-test\n"
                "  asrock_profile set  pbo2-test --llc 3\n"
                "  asrock_profile set  pbo2-test --soc-llc 5 -o soc5\n"
@@ -2038,10 +1282,6 @@ def build_parser():
                         metavar="N", help=T("手工指定 Setup 变量大小（默认自动探测）"))
 
     sub = ap.add_subparsers(dest="cmd")
-
-    p = sub.add_parser("gui", help=T("打开图形界面（可跟一个档案路径）"))
-    p.add_argument("files", nargs="*", help=T("启动时直接打开的档案（可选）"))
-    p.set_defaults(func=None)
 
     p = sub.add_parser("info", help=T("显示档案信息 + 已知字段当前值"))
     add_common(p)
@@ -2098,8 +1338,327 @@ def build_parser():
     return ap
 
 
-GUI_FLAGS = ("gui", "--gui", "-g", "/gui")
-SUBCOMMANDS = ("gui", "info", "get", "set", "dump", "inject", "boards")
+SUBCOMMANDS = ("info", "get", "set", "dump", "inject", "boards", "detect")
+
+
+def _interactive() -> bool:
+    """是不是「人在看着」的真实控制台（而不是管道 / 重定向 / 管道调用）。"""
+    try:
+        return bool(sys.stdout.isatty() and sys.stdin
+                    and sys.stdin.isatty())
+    except Exception:
+        return False
+
+
+def _quick_help() -> str:
+    """非交互环境（管道 / 脚本调用）下的兜底提示。
+
+    正常双击或拖入走的是 run_interactive()，不会到这里。
+    """
+    return T("""
+asrock_profile —— ASRock BIOS 用户配置档案编辑器
+（当前不是交互式终端，所以只显示速查。直接双击 exe 会有完整菜单。）
+
+最常用的四件事
+--------------
+  1. 看档案里现在是什么值
+       asrock_profile info  <档案>
+
+  2. 把 CPU 防掉压设成 Level 3（0=Auto，1..5=Level）
+       asrock_profile set  <档案> --llc 3
+
+  3. 同时改多个字段
+       asrock_profile set  <档案> --soc-llc 5 --byte 0x1B1=1
+
+  4. 看当前生效的 CPU 防掉压是几级（需要整片 SPI 镜像）
+       asrock_profile detect <镜像.bin> --baseline <上次.bin>
+
+完整帮助
+--------
+  asrock_profile -h
+  asrock_profile <子命令> -h
+
+把档案文件直接拖到这个 exe 上也行，等价于 `asrock_profile info <档案>`。
+""").lstrip()
+
+
+def _pause():
+    """等用户看完再关窗口。管道 / 非交互终端下直接返回，不会卡住脚本。"""
+    if not _interactive():
+        return
+    try:
+        print()
+        input(T("按回车键关闭…"))
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# 交互模式（双击 / 拖入时的入口）
+# --------------------------------------------------------------------------- #
+#
+# 为什么要有这个：控制台 exe 被双击时，窗口会在进程退出瞬间关闭。
+# 只要程序"跑完就退"，用户什么都看不到 —— 无论打的是帮助还是错误信息。
+# 交互模式的价值就是**让窗口留在那里，等用户操作完再关**。
+
+#: 交互模式里可改的字段菜单（编号 → (别名, 说明)）
+MENU_ITEMS = [
+    ("cpu-llc", "CPU Load-Line Calibration（防掉压，0=Auto 1..5=Level）"),
+    ("soc-llc", "VDDCR_SOC Load-Line Calibration（0=Auto 1..5=Level）"),
+]
+
+
+def _find_profiles(start=None):
+    """在常见位置找 ASRock 配置档案（按修改时间倒序）。
+
+    只看根目录 + 一层子目录，不做全盘扫描 —— 双击后要立刻出结果。
+    """
+    import glob
+    roots = [start] if start else [
+        os.path.expanduser("~"),
+        "H:/", "E:/", "D:/", "F:/",
+        os.getcwd(),
+    ]
+    hits, seen = [], set()
+    for root in roots:
+        if not root or not os.path.isdir(root):
+            continue
+        try:
+            for pat in ("*.mod", "*.bin", "pbo2*", "cpullc*", "profile*",
+                        "*user*default*", "*备份*"):
+                for path in glob.glob(os.path.join(root, pat)):
+                    rp = os.path.abspath(path)
+                    if rp in seen or not os.path.isfile(path):
+                        continue
+                    seen.add(rp)
+                    hits.append((os.path.getmtime(path), rp))
+        except Exception:
+            continue
+    hits.sort(reverse=True)
+    return [p for _, p in hits]
+
+
+def _ask(prompt):
+    """问一句并读一行。EOF / Ctrl-C 都返回 None（调用方决定怎么办）。"""
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+
+
+def _show_fields(p: Profile, path=None):
+    """列出偏移表：每个已知字段的偏移、名称、当前值。"""
+    print()
+    print(cyan(T("── 当前偏移表 ──")))
+    print("  %-10s %-38s %s" % (T("偏移"), T("字段"), T("当前值")))
+    print("  " + "-" * 66)
+    for off, size, kind, name in KNOWN_FIELDS:
+        if off + size > p.setup_size:
+            continue
+        try:
+            v = p.get_field(off, size)
+        except ProfileError:
+            continue
+        val = _fmt_value(off, v) if size == 1 else str(v)
+        if kind == "llc":
+            val = "%s (%s)" % (val, LLC_OPTIONS.get(v, "?"))
+        print("  0x%03X     %-38s %s" % (off, name[:38], val))
+    print("  " + "-" * 66)
+    print(T("  Setup 变量：%d 字节 @ 文件偏移 0x%X"
+            % (p.setup_size, p.setup_off)))
+
+
+def _show_warnings(p: Profile):
+    warns = board_warnings(p)
+    if not warns:
+        print(green(T("[OK] 板型 / BIOS 版本 / 字段自检 全部通过")))
+        return
+    for lv, msg in warns:
+        tag = yellow(T("[警告]")) if lv == WARN else red(T("[错误]"))
+        print("%s %s" % (tag, msg.replace("\n", "\n         ")))
+
+
+def run_interactive(initial=None):
+    """交互主循环。返回进程退出码。"""
+    # stdin 不是终端 ⇒ 有人在脚本里调用，不要进交互（会挂死）
+    if not _interactive():
+        print(_quick_help())
+        return 0
+
+    path = initial
+    if not path:
+        # ---- 第一步：选档案 ----
+        print()
+        print(cyan("=" * 68))
+        print(cyan(T("  asrock_profile —— ASRock BIOS 配置档案编辑器")))
+        print(cyan("=" * 68))
+        cands = _find_profiles()
+        if cands:
+            print()
+            print(T("自动找到这些档案（新的在前）："))
+            for i, c in enumerate(cands[:12], 1):
+                try:
+                    sz = os.path.getsize(c)
+                except OSError:
+                    sz = 0
+                print("  %2d) %-58s %d B" % (i, c, sz))
+            if len(cands) > 12:
+                print(T("      …… 还有 %d 个，输入 s 重新扫描" % (len(cands) - 12)))
+        else:
+            print(T("没自动找到档案。可以把文件拖到这个窗口里，或直接粘贴路径。"))
+
+        while True:
+            ans = _ask("\n" + T("请选档案编号，或粘贴完整路径（q 退出）: "))
+            if ans is None or ans.lower() in ("q", "quit", "exit", "退出"):
+                print(T("再见。"))
+                return 0
+            if not ans:
+                continue
+            if ans.lower() == "s":
+                cands = _find_profiles()
+                for i, c in enumerate(cands[:12], 1):
+                    print("  %2d) %s" % (i, c))
+                continue
+            if ans.isdigit() and cands:
+                n = int(ans)
+                if 1 <= n <= len(cands):
+                    path = cands[n - 1]
+                    break
+                print(red(T("编号超出范围")))
+                continue
+            path = ans
+            break
+
+    # ---- 第二步：载入 ----
+    try:
+        p = load(path)
+    except ProfileError as e:
+        print(red(T("打不开这个档案: %s") % e))
+        return 1
+    except FileNotFoundError:
+        print(red(T("找不到文件: %s") % path))
+        return 1
+    except OSError as e:
+        print(red(T("读取失败: %s") % e))
+        return 1
+
+    print()
+    print(green(T("已载入: %s") % os.path.abspath(path)))
+    _show_warnings(p)
+
+    # ---- 第三步：菜单循环 ----
+    pending = []            # [(offset, value), ...] 累积待写入
+    while True:
+        _show_fields(p, path)
+        print()
+        print(cyan(T("── 操作 ──")))
+        print("  1) %s" % MENU_ITEMS[0][1])
+        print("  2) %s" % MENU_ITEMS[1][1])
+        print("  3) %s" % T("改任意字节（偏移 + 新值）"))
+        print("  4) %s" % T("取消所有待写入的改动"))
+        print("  5) %s" % T("写出到新文件（不覆盖原档案）"))
+        print("  6) %s" % T("覆盖原档案（危险）"))
+        print("  0) %s" % T("退出"))
+        if pending:
+            print(yellow(T("待写入 %d 处: %s")
+                         % (len(pending),
+                            " ".join("0x%X=%02X" % (o, v) for o, v in pending))))
+
+        ans = _ask("\n" + T("选操作编号: ") )
+        if ans is None or ans in ("0", "q", "Q", "quit", "exit", "退出"):
+            if pending:
+                a = _ask(yellow(T("还有 %d 处改动没写出，确定退出？(y/N) " % len(pending))))
+                if not a or a.lower() not in ("y", "yes"):
+                    continue
+            print(T("再见。"))
+            return 0
+
+        try:
+            if ans in ("1", "2"):
+                idx = int(ans) - 1
+                spec = MENU_ITEMS[idx][0]
+                off = ALIASES[spec]
+                print("  " + T("当前值: %s") % _fmt_value(off, p.get_field(off, 1)))
+                for v, label in sorted(LLC_OPTIONS.items()):
+                    print("     %d = %s" % (v, label))
+                raw = _ask(T("要设成几级 (0-5): "))
+                if not raw:
+                    continue
+                val = int(raw, 0)
+                _check_llc(val)
+                pending = [x for x in pending if x[0] != off]
+                pending.append((off, val))
+                print(green(T("已加入待写入: Setup+0x%03X = %d (%s)")
+                            % (off, val, LLC_OPTIONS[val])))
+
+            elif ans == "3":
+                raw = _ask(T("偏移（0x1B1 或别名）: "))
+                if not raw:
+                    continue
+                off = _resolve_target(raw)
+                _check_off_spec(p, off)
+                raw2 = _ask(T("新值 (0-255): "))
+                if not raw2:
+                    continue
+                val = int(raw2, 0)
+                if not 0 <= val <= 0xFF:
+                    raise ProfileError(T("字节值必须在 0..255（给的是 %d）") % val)
+                pending = [x for x in pending if x[0] != off]
+                pending.append((off, val))
+                print(green(T("已加入待写入: Setup+0x%03X %s = %d")
+                            % (off, p.describe_field(off), val)))
+
+            elif ans == "4":
+                pending = []
+                print(T("已清空待写入列表。"))
+
+            elif ans in ("5", "6"):
+                if not pending:
+                    print(red(T("没有待写入的改动。")))
+                    continue
+                inplace = (ans == "6")
+                if inplace:
+                    b = _ask(red(T("确定覆盖原档案？输入 YES 确认: ")))
+                    if b != "YES":
+                        print(T("已取消。"))
+                        continue
+                # 复用与 `set` 子命令**完全相同**的构造 / 写出 / 自检逻辑
+                import argparse
+                args = argparse.Namespace(
+                    file=path,
+                    output=None,
+                    inplace=inplace,
+                    dry_run=False,
+                )
+                try:
+                    prof = load(path)
+                    plan = build_plan(prof, raw_bytes=list(pending))
+                    diffs = apply_plan(prof, plan, quiet=True)
+                    set_color(False)
+                    try:
+                        out = _report_and_write(prof, args, diffs)
+                    finally:
+                        set_color(sys.stdout.isatty())
+                except (ProfileError, OSError) as e:
+                    print(red(T("写出失败: %s") % e))
+                    continue
+                if not diffs:
+                    print(yellow(T("指定的值与当前值相同，无需写出。")))
+                    continue
+                # 写完重新载入，界面同步到新状态
+                path = out
+                p = load(path)
+                pending = []
+                print(green(T("界面已切换到新档案: %s") % os.path.abspath(path)))
+            else:
+                print(yellow(T("没有这个选项。")))
+
+        except ValueError as e:
+            print(red(T("输入不是数字: %s") % e))
+        except ProfileError as e:
+            print(red(T("操作失败: %s") % e))
+        except OSError as e:
+            print(red(T("文件操作失败: %s") % e))
 
 
 def main(argv=None):
@@ -2110,31 +1669,23 @@ def main(argv=None):
     argv = _apply_lang(argv)
     encoding_hint()
 
-    # 显式 GUI 入口：gui [file]
-    if argv and argv[0].lower() in GUI_FLAGS:
-        return run_gui([a for a in argv[1:] if not a.startswith("-")])
-
-    # 把档案直接拖到 exe 上（argv[0] 是存在的文件路径，不是子命令）⇒ 也用 GUI 打开。
-    # 只对「确实存在的文件」生效，所以子命令打错字时仍会走 argparse 给出正确报错。
+    # 把档案直接拖到 exe 上（argv[0] 是存在的文件路径、且不是子命令）
+    # ⇒ 打开它并进入交互模式。
+    # 只对「确实存在的文件」生效，所以子命令打错字时仍走 argparse 给出正确报错。
     if (argv and not argv[0].startswith("-")
-            and argv[0] not in SUBCOMMANDS and os.path.exists(argv[0])
-            and gui_available()):
-        return run_gui([argv[0]])
+            and argv[0] not in SUBCOMMANDS and os.path.exists(argv[0])):
+        return run_interactive(initial=argv[0])
 
-    # 无参数：GUI。控制台子系统下黑框会一起出现，正好当日志用，不藏。
+    # 无参数 = 双击启动 ⇒ 交互模式。
+    # 非交互终端（管道 / 脚本调用）下 run_interactive 会自动退回打印速查。
     if not argv:
-        if gui_available():
-            return run_gui(hide_console=False)
-        build_parser().print_help()
-        return 2
+        return run_interactive()
 
     ap = build_parser()
     args = ap.parse_args(argv)
     if not getattr(args, "cmd", None):
         ap.print_help()
-        return 2
-    if args.cmd == "gui":
-        return run_gui(args.files)
+        return 0
 
     try:
         return args.func(args)
@@ -2149,6 +1700,7 @@ def main(argv=None):
         print(red(T("错误: ")) + "%s: %s" % (type(e).__name__, e), file=sys.stderr)
         return 1
     except KeyboardInterrupt:
+        _pause()
         return 130
 
 
@@ -2160,898 +1712,392 @@ def main(argv=None):
 #   查不到就返回原文 ⇒ 漏译最多显示成中文，不会崩。
 #   改文案时的规矩：改了中文 key，就要同步改这里的 key（否则那条会退回中文显示）。
 EN = {
-    # 仍然要继续吗？
-    '\n\n仍然要继续吗？\n（建议先取消，把 info 输出贴到 issue）': (
-        ''
-        '\n'
-        '\nContinue anyway?'
-        '\n(Recommended: cancel and paste the `info` output into an issue)'
-    ),
-
     # 其余候选：
-    '\n        其余候选：': (
-        ''
-        '\n        other candidates: '
-    ),
-
+    '\n        其余候选：': '\n        other candidates: ',
+    # asrock_profile —— ASRock BIOS 
+    '\nasrock_profile —— ASRock BIOS 用户配置档案编辑器\n（当前不是交互式终端，所以只显示速查。直接双击 exe 会有完整菜单。）\n\n最常用的四件事\n--------------\n  1. 看档案里现在是什么值\n       asrock_profile info  <档案>\n\n  2. 把 CPU 防掉压设成 Level 3（0=Auto，1..5=Level）\n       asrock_profile set  <档案> --llc 3\n\n  3. 同时改多个字段\n       asrock_profile set  <档案> --soc-llc 5 --byte 0x1B1=1\n\n  4. 看当前生效的 CPU 防掉压是几级（需要整片 SPI 镜像）\n       asrock_profile detect <镜像.bin> --baseline <上次.bin>\n\n完整帮助\n--------\n  asrock_profile -h\n  asrock_profile <子命令> -h\n\n把档案文件直接拖到这个 exe 上也行，等价于 `asrock_profile info <档案>`。\n': "\nasrock_profile - ASRock BIOS profile editor\n(not an interactive terminal, so this is a cheat-sheet only;\n double-click the exe to get the full menu)\n\nThe four things you'll do most\n-----------------------------\n  1. See what the profile currently holds\n       asrock_profile info  <profile>\n\n  2. Set CPU Load-Line Calibration to Level 3 (0=Auto, 1..5=Level)\n       asrock_profile set  <profile> --llc 3\n\n  3. Change several fields at once\n       asrock_profile set  <profile> --soc-llc 5 --byte 0x1B1=1\n\n  4. Check which CPU LLC level is actually active (needs a full SPI image)\n       asrock_profile detect <image.bin> --baseline <previous.bin>\n\nFull help\n---------\n  asrock_profile -h\n  asrock_profile <subcommand> -h\n\nDragging a profile onto the exe works too - it opens the interactive menu.\n",
     # 已导出 Setup 原始数据 → %s
-    '\n已导出 Setup 原始数据 → %s': (
-        ''
-        '\nExported raw Setup data → %s'
-    ),
-
+    '\n已导出 Setup 原始数据 → %s': '\nExported raw Setup data → %s',
     # 没有任何改动。
-    '\n没有任何改动。': (
-        ''
-        '\nNo changes.'
-    ),
-
-    # （上面同时与当前打开的档案 %s 做了比对）
-    '\n（上面同时与当前打开的档案 %s 做了比对）': (
-        ''
-        '\n(also compared against the profile currently open: %s)'
-    ),
-
-    # （仅预览：未写出文件）
-    '\n（仅预览：未写出文件）': (
-        ''
-        '\n(preview only: no file written)'
-    ),
-
+    '\n没有任何改动。': '\nNo changes.',
     # ← ⚠ 未收录的版本
     '   ← ⚠ 未收录的版本': '   ← ⚠ version not in the known list',
-
     # ⚠ 单张镜像属**推断**（证据充分但非证明）。想 100%
-    '   ⚠ 单张镜像属**推断**（证据充分但非证明）。想 100% 确定，加 --baseline 给上一次的镜像。': (
-        '   ⚠ A single image only gives an **inference** (strong evidence, not proof). For'
-        ' 100% certainty, add --baseline with the previous image.'
-    ),
-
+    '   ⚠ 单张镜像属**推断**（证据充分但非证明）。想 100% 确定，加 --baseline 给上一次的镜像。': '   ⚠ A single image only gives an **inference** (strong evidence, not proof). For 100% certainty, add --baseline with the previous image.',
     # 判定依据：**基线对照** —— 基线里没有、当前镜像里有，
-    '   判定依据：**基线对照** —— 基线里没有、当前镜像里有，且是新增副本中偏移最大的': (
-        '   Basis: **baseline comparison** — absent in the baseline, present now, and the'
-        ' highest-addressed of the new copies'
-    ),
-
+    '   判定依据：**基线对照** —— 基线里没有、当前镜像里有，且是新增副本中偏移最大的': '   Basis: **baseline comparison** — absent in the baseline, present now, and the highest-addressed of the new copies',
     # 判定依据：活跃链的链尾（该链尾内容在其它链里找不到 ⇒ 是全
-    '   判定依据：活跃链的链尾（该链尾内容在其它链里找不到 ⇒ 是全新状态；且链内变体数最多 ⇒ 记录着每次状态变化）': (
-        '   Basis: the tail of the live chain (its content appears in no other chain ⇒ it is a'
-        ' brand-new state; and it holds the most variants ⇒ it records every state change)'
-    ),
-
+    '   判定依据：活跃链的链尾（该链尾内容在其它链里找不到 ⇒ 是全新状态；且链内变体数最多 ⇒ 记录着每次状态变化）': '   Basis: the tail of the live chain (its content appears in no other chain ⇒ it is a brand-new state; and it holds the most variants ⇒ it records every state change)',
     # 要检测当前生效值，请给一张整片 SPI 镜像（AFU 备份出
-    '   要检测当前生效值，请给一张整片 SPI 镜像（AFU 备份出来的 .bin）。': (
-        '   To detect the active value, pass a full SPI image (a .bin backed up with AFU).'
-    ),
-
+    '   要检测当前生效值，请给一张整片 SPI 镜像（AFU 备份出来的 .bin）。': '   To detect the active value, pass a full SPI image (a .bin backed up with AFU).',
     # %-8s %-46s  已实测版本: %s
     '  %-8s %-46s  已实测版本: %s': '  %-8s %-46s  tested versions: %s',
-
     # 1) 把 %s 拷到 FAT32 U 盘根目录
     '  1) 把 %s 拷到 FAT32 U 盘根目录': '  1) Copy %s to the root of a FAT32 USB stick',
-
     # 2) 进 BIOS → Load User Default 
-    '  2) 进 BIOS → Load User Default from USB flash drive → 选它': (
-        '  2) Enter BIOS → Load User Default from USB flash drive → pick it'
-    ),
-
+    '  2) 进 BIOS → Load User Default from USB flash drive → 选它': '  2) Enter BIOS → Load User Default from USB flash drive → pick it',
     # 3) F10 保存退出 → 重启
     '  3) F10 保存退出 → 重启': '  3) F10 to save and exit → reboot',
-
+    # asrock_profile —— ASRock BIOS 
+    '  asrock_profile —— ASRock BIOS 配置档案编辑器': '  asrock_profile - ASRock BIOS profile editor',
     # ← 活跃链
     '  ← 活跃链': '  ← live chain',
-
     # ⇒ 最新写入的副本 = @0x%06X（新增副本里偏移最大的
-    '  ⇒ 最新写入的副本 = @0x%06X（新增副本里偏移最大的那个）': (
-        '  ⇒ newest copy written = @0x%06X (the highest-addressed of the new copies)'
-    ),
-
+    '  ⇒ 最新写入的副本 = @0x%06X（新增副本里偏移最大的那个）': '  ⇒ newest copy written = @0x%06X (the highest-addressed of the new copies)',
     # ⚠ BIOS 菜单里不会因此多出条目；换档位就换一个档案载入
-    '  ⚠ BIOS 菜单里不会因此多出条目；换档位就换一个档案载入': (
-        '  ⚠ This will NOT add a BIOS menu entry; to change level, load a different profile'
-    ),
-
+    '  ⚠ BIOS 菜单里不会因此多出条目；换档位就换一个档案载入': '  ⚠ This will NOT add a BIOS menu entry; to change level, load a different profile',
     # ⚠ 副本数远多于预期是正常的（NVRAM compactio
-    '  ⚠ 副本数远多于预期是正常的（NVRAM compaction 会留下大量历史版本），关键是**哪一条最新**': (
-        '  ⚠ Far more copies than expected is normal (NVRAM compaction leaves plenty of'
-        ' historical versions); what matters is **which one is newest**'
-    ),
-
+    '  ⚠ 副本数远多于预期是正常的（NVRAM compaction 会留下大量历史版本），关键是**哪一条最新**': '  ⚠ Far more copies than expected is normal (NVRAM compaction leaves plenty of historical versions); what matters is **which one is newest**',
     # ⚠ 没有新增副本 —— 基线可能不是同一个状态，退回单张镜像
-    '  ⚠ 没有新增副本 —— 基线可能不是同一个状态，退回单张镜像的推断': (
-        '  ⚠ No new copies — the baseline may not be the same state; falling back to'
-        ' single-image inference'
-    ),
-
+    '  ⚠ 没有新增副本 —— 基线可能不是同一个状态，退回单张镜像的推断': '  ⚠ No new copies — the baseline may not be the same state; falling back to single-image inference',
     # ✘ 一个副本都没找到 —— 这张镜像可能不是本板/本版本的。
-    '  ✘ 一个副本都没找到 —— 这张镜像可能不是本板/本版本的。': (
-        '  ✘ Not a single copy found — this image is probably not from this board/version.'
-    ),
-
+    '  ✘ 一个副本都没找到 —— 这张镜像可能不是本板/本版本的。': '  ✘ Not a single copy found — this image is probably not from this board/version.',
     # 两次读取之间：新增 %d 处、消失 %d 处（新增 = 这段
-    '  两次读取之间：新增 %d 处、消失 %d 处（新增 = 这段时间里写进去的）': (
-        '  Between the two reads: %d new, %d gone (new = written in that window)'
-    ),
-
+    '  两次读取之间：新增 %d 处、消失 %d 处（新增 = 这段时间里写进去的）': '  Between the two reads: %d new, %d gone (new = written in that window)',
     # 交叉核对: DRAM %d mV / VTT_DDR %d 
     '  交叉核对: DRAM %d mV / VTT_DDR %d mV ⇒ %s': '  Cross-check: DRAM %d mV / VTT_DDR %d mV ⇒ %s',
-
     # 基线副本 %d 处，当前副本 %d 处
     '  基线副本 %d 处，当前副本 %d 处': '  baseline copies: %d, current copies: %d',
-
     # 文件 0x%06X  %02X → %02X  Setup+
-    '  文件 0x%06X  %02X → %02X  Setup+0x%03X  %s': (
-        '  file 0x%06X  %02X → %02X  Setup+0x%03X  %s'
-    ),
-
+    '  文件 0x%06X  %02X → %02X  Setup+0x%03X  %s': '  file 0x%06X  %02X → %02X  Setup+0x%03X  %s',
     # 文件 0x%06X  %02X → %02X%s  %s
     '  文件 0x%06X  %02X → %02X%s  %s': '  file 0x%06X  %02X → %02X%s  %s',
-
     # 新增副本的 +0x190 分布: %s
     '  新增副本的 +0x190 分布: %s': '  +0x190 distribution of the new copies: %s',
-
     # 档案里的 CPU LLC = %s；镜像里的 = %s ⇒ 
-    '  档案里的 CPU LLC = %s；镜像里的 = %s ⇒ %s': (
-        '  CPU LLC in the profile = %s; in the image = %s ⇒ %s'
-    ),
-
+    '  档案里的 CPU LLC = %s；镜像里的 = %s ⇒ %s': '  CPU LLC in the profile = %s; in the image = %s ⇒ %s',
     # 特征串命中 %d 处；与共识副本比对后保留 %d 处（差异 
-    '  特征串命中 %d 处；与共识副本比对后保留 %d 处（差异 %d–%d 字节）、淘汰 %d 处': (
-        '  signature hits: %d; after comparison with the consensus copy, kept %d (differences'
-        ' %d–%d bytes), rejected %d'
-    ),
-
-    # 1. 档案
-    ' 1. 档案 ': ' 1. Profile ',
-
-    # 2. 档案信息与检查
-    ' 2. 档案信息与检查 ': ' 2. Profile info & checks ',
-
-    # 3. 检测当前状态（读整片 SPI 镜像，例如 AFU 备份
-    ' 3. 检测当前状态（读整片 SPI 镜像，例如 AFU 备份出来的 r5.bin）': (
-        ' 3. Detect current state (read a full SPI image, e.g. r5.bin backed up by AFU)'
-    ),
-
-    # 4. 已知字段当前值（只读，供核对偏移表是否匹配）
-    ' 4. 已知字段当前值（只读，供核对偏移表是否匹配）': (
-        ' 4. Known field values (read-only; use it to check the offset table)'
-    ),
-
-    # 5. 修改
-    ' 5. 修改 ': ' 5. Changes ',
-
-    # 6. 输出
-    ' 6. 输出 ': ' 6. Output ',
-
-    # 7. 日志
-    ' 7. 日志 ': ' 7. Log ',
-
+    '  特征串命中 %d 处；与共识副本比对后保留 %d 处（差异 %d–%d 字节）、淘汰 %d 处': '  signature hits: %d; after comparison with the consensus copy, kept %d (differences %d–%d bytes), rejected %d',
     # %s %d 字节（与源文件%s）
     '%s %d 字节（与源文件%s）': '%s %d bytes (source file: %s)',
-
     # %s Setup+0x%03X %s 已经是 %s，跳过
     '%s Setup+0x%03X %s 已经是 %s，跳过': '%s Setup+0x%03X %s is already %s, skipping',
-
     # (不改)
     '(不改)': '(no change)',
-
     # (不限版本)
     '(不限版本)': '(any version)',
-
     # (未知字段)
     '(未知字段)': '(unknown field)',
-
     # **不一致 ✘**
     '**不一致 ✘**': '**MISMATCH ✘**',
-
     # **不符合**，这条链可能不是真 Setup 副本 ✘
-    '**不符合**，这条链可能不是真 Setup 副本 ✘': (
-        '**does NOT match**, this chain may not be a real Setup copy ✘'
-    ),
-
+    '**不符合**，这条链可能不是真 Setup 副本 ✘': '**does NOT match**, this chain may not be a real Setup copy ✘',
     # --dry-run：仅预览，未写出任何文件（以上为将会发生的
-    '--dry-run：仅预览，未写出任何文件（以上为将会发生的改动）。': (
-        '--dry-run: preview only, nothing was written (the above is what would happen).'
-    ),
-
+    '--dry-run：仅预览，未写出任何文件（以上为将会发生的改动）。': '--dry-run: preview only, nothing was written (the above is what would happen).',
     # === Setup 副本定位（内容特征串全片扫描） ===
-    '=== Setup 副本定位（内容特征串全片扫描） ===': (
-        '=== Locating Setup copies (whole-image scan for the content signature) ==='
-    ),
-
+    '=== Setup 副本定位（内容特征串全片扫描） ===': '=== Locating Setup copies (whole-image scan for the content signature) ===',
     # === 与基线对照: %s ===
     '=== 与基线对照: %s ===': '=== Compared with the baseline: %s ===',
-
     # === 与档案 %s 比对 ===
     '=== 与档案 %s 比对 ===': '=== Compared with profile %s ===',
-
     # === 副本链表（按 NVAR 头的 u24 指针串成；链尾
-    '=== 副本链表（按 NVAR 头的 u24 指针串成；链尾 = 最新写入） ===': (
-        '=== Copy chains (linked by the u24 pointer in each NVAR header; tail = newest write)'
-        ' ==='
-    ),
-
+    '=== 副本链表（按 NVAR 头的 u24 指针串成；链尾 = 最新写入） ===': '=== Copy chains (linked by the u24 pointer in each NVAR header; tail = newest write) ===',
     # === 档案里写明的值 ===
     '=== 档案里写明的值 ===': '=== Value as stored in the profile ===',
-
     # === 结论（读活跃链的链尾记录 @0x%06X） ===
-    '=== 结论（读活跃链的链尾记录 @0x%06X） ===': (
-        "=== Verdict (reading the live chain's tail record @0x%06X) ==="
-    ),
-
+    '=== 结论（读活跃链的链尾记录 @0x%06X） ===': "=== Verdict (reading the live chain's tail record @0x%06X) ===",
     # ASRock BIOS 用户配置档案（U 盘档案）编辑器 —
-    'ASRock BIOS 用户配置档案（U 盘档案）编辑器 —— 用来修改档案里内嵌的 Setup 变量字节。  不带参数运行即打开图形界面。': (
-        'ASRock BIOS profile (USB config file) editor — for editing the Setup variable bytes'
-        ' embedded in such a profile.  Run it with no arguments to open the GUI.'
-    ),
-
-    # ASRock 配置档案编辑器  ·  asrock_prof
-    'ASRock 配置档案编辑器  ·  asrock_profile %s': 'ASRock profile editor  ·  asrock_profile %s',
-
+    'ASRock BIOS 用户配置档案（U 盘档案）编辑器 —— 用来修改档案里内嵌的 Setup 变量字节。': 'ASRock BIOS profile (USB config file) editor — for editing the Setup variable bytes embedded in such a profile.',
     # ASRock 配置档案（BIOS 导出到 U 盘的那个文件）
-    'ASRock 配置档案（BIOS 导出到 U 盘的那个文件）': (
-        'ASRock profile (the file the BIOS exports to a USB stick)'
-    ),
-
-    # BIN 镜像
-    'BIN 镜像': 'BIN images',
-
+    'ASRock 配置档案（BIOS 导出到 U 盘的那个文件）': 'ASRock profile (the file the BIOS exports to a USB stick)',
     # BIOS 版本: %r%s
     'BIOS 版本: %r%s': 'BIOS version: %r%s',
-
     # BIOS 版本未收录：档案版本是 %r，已实测的是 %s。
-    'BIOS 版本未收录：档案版本是 %r，已实测的是 %s。\n    同板型换版本通常兼容，但 Setup 变量布局有变动的可能，改前请核对字段值是否合理。': (
-        'BIOS version not in the known list: the profile says %r, tested: %s.'
-        '\n    A different version of the same board is usually compatible, but the Setup'
-        ' variable layout may have moved — check the field values first.'
-    ),
-
+    'BIOS 版本未收录：档案版本是 %r，已实测的是 %s。\n    同板型换版本通常兼容，但 Setup 变量布局有变动的可能，改前请核对字段值是否合理。': 'BIOS version not in the known list: the profile says %r, tested: %s.\n    A different version of the same board is usually compatible, but the Setup variable layout may have moved — check the field values first.',
     # CPU Load-Line Calibration（Setu
-    'CPU Load-Line Calibration（Setup+0x190），0=Auto 1..5=Level': (
-        'CPU Load-Line Calibration (Setup+0x190), 0=Auto 1..5=Level'
-    ),
-
+    'CPU Load-Line Calibration（Setup+0x190），0=Auto 1..5=Level': 'CPU Load-Line Calibration (Setup+0x190), 0=Auto 1..5=Level',
     # Load-Line 等级只能是 0..5（0=Auto），给
     'Load-Line 等级只能是 0..5（0=Auto），给的是 %d': 'Load-Line level must be 0..5 (0=Auto), got %d',
-
-    # Setup 偏移
-    'Setup 偏移': 'Setup offset',
-
     # Setup 原始数据（%d 字节）→ %s
     'Setup 原始数据（%d 字节）→ %s': 'Raw Setup data (%d bytes) → %s',
-
     # Setup 变量位置: 0x%X–0x%X  (%d 字节)
     'Setup 变量位置: 0x%X–0x%X  (%d 字节)': 'Setup variable: 0x%X–0x%X  (%d bytes)',
-
     # Setup 变量位置: 0x%X–0x%X (%d 字节)
     'Setup 变量位置: 0x%X–0x%X (%d 字节)': 'Setup variable: 0x%X–0x%X (%d bytes)',
-
     # Setup 变量大小（默认 0x280）
     'Setup 变量大小（默认 0x280）': 'Setup variable size (default 0x280)',
-
     # Setup 块 [0x%X, 0x%X) 超出文件范围（文件
-    'Setup 块 [0x%X, 0x%X) 超出文件范围（文件 %d 字节）': (
-        'Setup block [0x%X, 0x%X) is outside the file (%d bytes)'
-    ),
-
+    'Setup 块 [0x%X, 0x%X) 超出文件范围（文件 %d 字节）': 'Setup block [0x%X, 0x%X) is outside the file (%d bytes)',
     # Setup+0x%03X 未生效
     'Setup+0x%03X 未生效': 'Setup+0x%03X did not take effect',
-
     # VDDCR_SOC Load-Line Calibratio
-    'VDDCR_SOC Load-Line Calibration（Setup+0x191）': (
-        'VDDCR_SOC Load-Line Calibration (Setup+0x191)'
-    ),
-
+    'VDDCR_SOC Load-Line Calibration（Setup+0x191）': 'VDDCR_SOC Load-Line Calibration (Setup+0x191)',
+    # [OK] 板型 / BIOS 版本 / 字段自检 全部通过
+    '[OK] 板型 / BIOS 版本 / 字段自检 全部通过': '[OK] board / BIOS version / field self-check all passed',
     # [版型警告]
     '[版型警告]': '[board warning]',
-
+    # [警告]
+    '[警告]': '[warn]',
     # [跳过]
     '[跳过]': '[skip]',
-
     # [错误]
     '[错误]': '[error]',
-
-    # ⚠ 版型检查未通过
-    '⚠ 版型检查未通过': '⚠ Board check failed',
-
+    # ── 当前偏移表 ──
+    '── 当前偏移表 ──': '-- Current values --',
+    # ── 操作 ──
+    '── 操作 ──': '-- Actions --',
     # ⚠ 读档案 %s 失败: %s
     '⚠ 读档案 %s 失败: %s': '⚠ Failed to read profile %s: %s',
-
     # ⚠ 这是**档案里的值**，不是主板上当前生效的值。
-    '⚠ 这是**档案里的值**，不是主板上当前生效的值。': (
-        '⚠ This is the value **inside the profile**, not what is currently active on the'
-        ' board.'
-    ),
-
-    # ✔ 板型 / 版本 / 字段自检：全部通过
-    '✔ 板型 / 版本 / 字段自检：全部通过': '✔ Board / version / field self-check: all passed',
-
-    # ✔ 板型、BIOS 版本与字段自检均通过。
-    '✔ 板型、BIOS 版本与字段自检均通过。': '✔ Board, BIOS version and field self-check all passed.',
-
+    '⚠ 这是**档案里的值**，不是主板上当前生效的值。': '⚠ This is the value **inside the profile**, not what is currently active on the board.',
     # ✔ 自检通过：长度一致，且只有上述字节被改动
-    '✔ 自检通过：长度一致，且只有上述字节被改动': (
-        '✔ Self-check passed: same length, and only the bytes listed above were changed'
-    ),
-
-    # ✘ 检测失败: %s
-    '✘ 检测失败: %s': '✘ Detection failed: %s',
-
+    '✔ 自检通过：长度一致，且只有上述字节被改动': '✔ Self-check passed: same length, and only the bytes listed above were changed',
     # ✘ 自检失败:
     '✘ 自检失败:': '✘ Self-check failed:',
-
-    # ✘ 载入失败：%s
-    '✘ 载入失败：%s': '✘ Load failed: %s',
-
     # 、
     '、': ', ',
-
     # 一致
     '一致': 'same',
-
     # 一致 ✔
     '一致 ✔': 'match ✔',
-
     # 上一次读的镜像 —— 给了就能 100%% 确定（靠「哪条链
-    '上一次读的镜像 —— 给了就能 100%% 确定（靠「哪条链增长了」判定）': (
-        'The previously read image — supplying it makes the verdict 100%% certain (decided by'
-        ' which chain grew)'
-    ),
-
+    '上一次读的镜像 —— 给了就能 100%% 确定（靠「哪条链增长了」判定）': 'The previously read image — supplying it makes the verdict 100%% certain (decided by which chain grew)',
     # 下一步:
     '下一步:': 'Next steps:',
-
-    # 下拉框取值异常，请重新选择。
-    '下拉框取值异常，请重新选择。': 'Unexpected dropdown value, please pick again.',
-
     # 不一致
     '不一致': 'differs',
-
     # 不一致 ✘
     '不一致 ✘': 'does not match ✘',
-
-    # 仅预览（不写文件）
-    '仅预览（不写文件）': 'Preview only (write nothing)',
-
     # 任意字节，可重复。OFF 支持别名或十六进制（如 0x1B1
-    '任意字节，可重复。OFF 支持别名或十六进制（如 0x1B1=1）': (
-        'Any byte, repeatable. OFF accepts an alias or hex (e.g. 0x1B1=1)'
-    ),
-
+    '任意字节，可重复。OFF 支持别名或十六进制（如 0x1B1=1）': 'Any byte, repeatable. OFF accepts an alias or hex (e.g. 0x1B1=1)',
     # 低区 [11]
     '低区 [11]': 'low region [11]',
-
     # 修改字段并写出新档案
     '修改字段并写出新档案': 'Modify fields and write a new profile',
-
     # 值 %d 超出 %d 字节范围
     '值 %d 超出 %d 字节范围': 'Value %d does not fit in %d byte(s)',
-
-    # 值不合法
-    '值不合法': 'Invalid value',
-
-    # 值可以是十进制或 0x 开头的十六进制。
-    '值可以是十进制或 0x 开头的十六进制。': 'The value may be decimal, or hex with a 0x prefix.',
-
-    # 值越界
-    '值越界': 'Value out of range',
-
+    # 偏移
+    '偏移': 'Offset',
     # 偏移 0x%X (size %d) 超出 Setup 变量范
-    '偏移 0x%X (size %d) 超出 Setup 变量范围 [0, 0x%X)': (
-        'Offset 0x%X (size %d) is outside the Setup variable range [0, 0x%X)'
-    ),
-
+    '偏移 0x%X (size %d) 超出 Setup 变量范围 [0, 0x%X)': 'Offset 0x%X (size %d) is outside the Setup variable range [0, 0x%X)',
     # 偏移 0x%X 变成 %02X，预期 %s
     '偏移 0x%X 变成 %02X，预期 %s': 'Offset 0x%X became %02X, expected %s',
-
     # 偏移 0x%X 超出 Setup 变量范围 [0, 0x%X
-    '偏移 0x%X 超出 Setup 变量范围 [0, 0x%X)': (
-        'Offset 0x%X is outside the Setup variable range [0, 0x%X)'
-    ),
-
-    # 偏移越界
-    '偏移越界': 'Offset out of range',
-
-    # 写出失败
-    '写出失败': 'Write failed',
-
-    # 切换后界面立刻重建，已载入的档案、待改动与日志都会保留
-    '切换后界面立刻重建，已载入的档案、待改动与日志都会保留': (
-        'Switching rebuilds the UI immediately; the loaded profile, pending changes and log'
-        ' are all kept'
-    ),
-
+    '偏移 0x%X 超出 Setup 变量范围 [0, 0x%X)': 'Offset 0x%X is outside the Setup variable range [0, 0x%X)',
+    # 偏移（0x1B1 或别名）:
+    '偏移（0x1B1 或别名）: ': 'Offset (0x1B1 or an alias): ',
+    # 再见。
+    '再见。': 'Bye.',
+    # 写出到新文件（不覆盖原档案）
+    '写出到新文件（不覆盖原档案）': 'Write to a NEW file (leaves the source alone)',
+    # 写出失败: %s
+    '写出失败: %s': 'Write failed: %s',
     # 列出已收录的板型
     '列出已收录的板型': 'List known boards',
-
-    # 删除选中
-    '删除选中': 'Remove selected',
-
-    # 加入改动：Setup+0x%03X %s = %s
-    '加入改动：Setup+0x%03X %s = %s': 'Added change: Setup+0x%03X %s = %s',
-
     # 区域
     '区域': 'region',
-
-    # 原值
-    '原值': 'Old',
-
     # 原始数据长度 %d 与目标 Setup 块大小 %d 不一致
-    '原始数据长度 %d 与目标 Setup 块大小 %d 不一致': (
-        'Raw data length %d does not match the target Setup block size %d'
-    ),
-
+    '原始数据长度 %d 与目标 Setup 块大小 %d 不一致': 'Raw data length %d does not match the target Setup block size %d',
+    # 取消所有待写入的改动
+    '取消所有待写入的改动': 'Discard all pending changes',
     # 变体数
     '变体数': 'variants',
-
-    # 另存为…
-    '另存为…': 'Save as…',
-
     # 只看改动，不写文件
     '只看改动，不写文件': 'Only show the changes, write nothing',
-
     # 否（⇒ 新状态）
     '否（⇒ 新状态）': 'no (⇒ new state)',
-
-    # 启动时直接打开的档案（可选）
-    '启动时直接打开的档案（可选）': 'Profile to open on startup (optional)',
-
     # 大小:
     '大小:': 'Size:',
-
     # 大小: %d 字节
     '大小: %d 字节': 'Size: %d bytes',
-
     # 字段
     '字段': 'Field',
-
     # 字段偏移表只对已实测的板型负责。请先用 `info` 核对几
-    '字段偏移表只对已实测的板型负责。请先用 `info` 核对几条已知量是否合理：\n    Setup+0x1A8 DRAM Voltage 应是合理内存电压（如 1200–1500 mV），\n    且 Setup+0x1A6 VTT_DDR 约为它的一半。\n    数值明显不合理 ⇒ **不要改**，先把 `info` 输出贴到 issue 补字段表。': (
-        'The field offset table is only guaranteed for boards that were actually tested. First'
-        ' check a few known values with `info`:'
-        '\n    Setup+0x1A8 DRAM Voltage should be a sane memory voltage (say 1200–1500 mV),'
-        '\n    and Setup+0x1A6 VTT_DDR should be about half of it.'
-        '\n    Obviously wrong numbers ⇒ **do not write** — open an issue and paste your'
-        ' `info` output so the table can be extended.'
-    ),
-
+    '字段偏移表只对已实测的板型负责。请先用 `info` 核对几条已知量是否合理：\n    Setup+0x1A8 DRAM Voltage 应是合理内存电压（如 1200–1500 mV），\n    且 Setup+0x1A6 VTT_DDR 约为它的一半。\n    数值明显不合理 ⇒ **不要改**，先把 `info` 输出贴到 issue 补字段表。': 'The field offset table is only guaranteed for boards that were actually tested. First check a few known values with `info`:\n    Setup+0x1A8 DRAM Voltage should be a sane memory voltage (say 1200–1500 mV),\n    and Setup+0x1A6 VTT_DDR should be about half of it.\n    Obviously wrong numbers ⇒ **do not write** — open an issue and paste your `info` output so the table can be extended.',
     # 字段别名（如 cpu-llc）或十六进制偏移（如 0x190
     '字段别名（如 cpu-llc）或十六进制偏移（如 0x190）': 'Field alias (e.g. cpu-llc) or hex offset (e.g. 0x190)',
-
     # 字段自检异常：Setup+0x1A8 DRAM Voltag
-    '字段自检异常：Setup+0x1A8 DRAM Voltage = %d mV，但 Setup+0x1A6 VTT_DDR = %d mV；DDR4 下 VTT_DDR 应约为 DRAM 的一半。\n    这说明字段偏移表与本档案不匹配（板型/BIOS 版本不同），**请不要继续改写**。': (
-        'Field self-check failed: Setup+0x1A8 DRAM Voltage = %d mV but Setup+0x1A6 VTT_DDR ='
-        ' %d mV; on DDR4, VTT_DDR should be about half of DRAM.'
-        '\n    This means the field offset table does not match this profile (different'
-        ' board/BIOS version) — **please stop and do not write**.'
-    ),
-
-    # 字节值必须在 0..255。
-    '字节值必须在 0..255。': 'Byte value must be 0..255.',
-
+    '字段自检异常：Setup+0x1A8 DRAM Voltage = %d mV，但 Setup+0x1A6 VTT_DDR = %d mV；DDR4 下 VTT_DDR 应约为 DRAM 的一半。\n    这说明字段偏移表与本档案不匹配（板型/BIOS 版本不同），**请不要继续改写**。': 'Field self-check failed: Setup+0x1A8 DRAM Voltage = %d mV but Setup+0x1A6 VTT_DDR = %d mV; on DDR4, VTT_DDR should be about half of DRAM.\n    This means the field offset table does not match this profile (different board/BIOS version) — **please stop and do not write**.',
     # 字节值必须在 0..255（Setup+0x%03X 给的是
-    '字节值必须在 0..255（Setup+0x%03X 给的是 %d）': (
-        'Byte value must be 0..255 (Setup+0x%03X was given %d)'
-    ),
-
+    '字节值必须在 0..255（Setup+0x%03X 给的是 %d）': 'Byte value must be 0..255 (Setup+0x%03X was given %d)',
+    # 字节值必须在 0..255（给的是 %d）
+    '字节值必须在 0..255（给的是 %d）': 'Byte value must be 0..255 (got %d)',
     # 字节级 diff (%d 处):
     '字节级 diff (%d 处):': 'Byte-level diff (%d change(s)):',
-
-    # 完成
-    '完成': 'Done',
-
     # 导出 Setup 原始数据
     '导出 Setup 原始数据': 'Export the raw Setup data',
-
     # 将把 %d 字节写入 Setup 块，产生 %d 处改动
-    '将把 %d 字节写入 Setup 块，产生 %d 处改动': (
-        'Will write %d bytes into the Setup block, producing %d change(s)'
-    ),
-
+    '将把 %d 字节写入 Setup 块，产生 %d 处改动': 'Will write %d bytes into the Setup block, producing %d change(s)',
     # 将改动的文件字节 (%d 处，仅预览):
     '将改动的文件字节 (%d 处，仅预览):': 'File bytes that would change (%d change(s), preview only):',
-
     # 将要改动:
     '将要改动:': 'About to change:',
-
     # 尾是否已在别处出现
     '尾是否已在别处出现': 'tail seen elsewhere?',
-
     # 已写出:
     '已写出:': 'Written:',
-
-    # 已写出：
-    '已写出：\n%s\n\n请把它拷到 FAT32 U 盘根目录，再进 BIOS 用 “Load User Default from USB flash drive” 载入。': (
-        'Written:'
-        '\n%s'
-        '\n'
-        '\nCopy it to the root of a FAT32 USB stick, then load it in the BIOS via “Load User'
-        ' Default from USB flash drive”.'
-    ),
-
-    # 已把 %s 记为基线（下次检测会做基线对照，判定 100%%
-    '已把 %s 记为基线（下次检测会做基线对照，判定 100%% 确定）': (
-        '%s recorded as the baseline (the next detection compares against it and is 100%%'
-        ' certain)'
-    ),
-
+    # 已加入待写入: Setup+0x%03X %s = %d
+    '已加入待写入: Setup+0x%03X %s = %d': 'Queued: Setup+0x%03X %s = %d',
+    # 已加入待写入: Setup+0x%03X = %d (%s)
+    '已加入待写入: Setup+0x%03X = %d (%s)': 'Queued: Setup+0x%03X = %d (%s)',
+    # 已取消。
+    '已取消。': 'Cancelled.',
     # 已收录的板型:
     '已收录的板型:': 'Known boards:',
-
-    # 已清空待改动列表
-    '已清空待改动列表': 'Pending changes cleared',
-
+    # 已清空待写入列表。
+    '已清空待写入列表。': 'Pending changes cleared.',
     # 已知字段当前值:
     '已知字段当前值:': 'Known field values:',
-
-    # 应用并写出
-    '应用并写出': 'Apply & write',
-
+    # 已载入: %s
+    '已载入: %s': 'Loaded: %s',
     # 当前 CPU Load-Line Calibration =
     '当前 CPU Load-Line Calibration = %s': 'Current CPU Load-Line Calibration = %s',
-
     # 当前值
     '当前值': 'Value',
-
-    # 所有文件
-    '所有文件': 'All files',
-
+    # 当前值: %s
+    '当前值: %s': 'Current: %s',
+    # 待写入 %d 处: %s
+    '待写入 %d 处: %s': '%d pending change(s): %s',
     # 手工指定 Setup 变量在文件里的偏移（默认自动探测）
-    '手工指定 Setup 变量在文件里的偏移（默认自动探测）': (
-        'Set the Setup variable offset manually (auto-detected by default)'
-    ),
-
+    '手工指定 Setup 变量在文件里的偏移（默认自动探测）': 'Set the Setup variable offset manually (auto-detected by default)',
     # 手工指定 Setup 变量大小（默认自动探测）
-    '手工指定 Setup 变量大小（默认自动探测）': (
-        'Set the Setup variable size manually (auto-detected by default)'
-    ),
-
-    # 打开图形界面（可跟一个档案路径）
-    '打开图形界面（可跟一个档案路径）': 'Open the GUI (optionally followed by a profile path)',
-
-    # 打开失败
-    '打开失败': 'Open failed',
-
-    # 打开档案…
-    '打开档案…': 'Open profile…',
-
-    # 打开输出目录
-    '打开输出目录': 'Open output folder',
-
-    # 找不到文件
-    '找不到文件': 'File not found',
-
+    '手工指定 Setup 变量大小（默认自动探测）': 'Set the Setup variable size manually (auto-detected by default)',
+    # 打不开这个档案: %s
+    '打不开这个档案: %s': 'Cannot open that profile: %s',
     # 找不到文件 %s
     '找不到文件 %s': 'File not found: %s',
-
+    # 找不到文件: %s
+    '找不到文件: %s': 'File not found: %s',
     # 把 Setup 原始数据塞回档案
     '把 Setup 原始数据塞回档案': 'Inject raw Setup data back into a profile',
-
     # 指定的值与当前值相同，无需写出。
-    '指定的值与当前值相同，无需写出。': 'The specified value equals the current one; nothing to write.',
-
+    '指定的值与当前值相同，无需写出。': 'Those values equal the current ones; nothing to write.',
+    # 按回车键关闭…
+    '按回车键关闭…': 'Press Enter to close...',
     # 探测: %s
     '探测: %s': 'Detection: %s',
-
+    # 操作失败: %s
+    '操作失败: %s': 'Action failed: %s',
+    # 改任意字节（偏移 + 新值）
+    '改任意字节（偏移 + 新值）': 'Change an arbitrary byte (offset + value)',
     # 整片 SPI 镜像（AFU 备份的 .bin）或 U 盘配置
-    '整片 SPI 镜像（AFU 备份的 .bin）或 U 盘配置档案': (
-        'Full SPI image (a .bin backed up by AFU) or a USB config profile'
-    ),
-
+    '整片 SPI 镜像（AFU 备份的 .bin）或 U 盘配置档案': 'Full SPI image (a .bin backed up by AFU) or a USB config profile',
     # 文件: %s
     '文件: %s': 'File: %s',
-
     # 文件太小（%d 字节），不像 ASRock 配置档案
     '文件太小（%d 字节），不像 ASRock 配置档案': 'File is too small (%d bytes) to be an ASRock profile',
-
     # 文件头不是可打印 ASCII，可能不是 ASRock 配置档
-    '文件头不是可打印 ASCII，可能不是 ASRock 配置档案（前 32 字节: %r）': (
-        'The file header is not printable ASCII — this may not be an ASRock profile (first 32'
-        ' bytes: %r)'
-    ),
-
+    '文件头不是可打印 ASCII，可能不是 ASRock 配置档案（前 32 字节: %r）': 'The file header is not printable ASCII — this may not be an ASRock profile (first 32 bytes: %r)',
+    # 文件操作失败: %s
+    '文件操作失败: %s': 'File operation failed: %s',
     # 文件长度变了（%d → %d）
     '文件长度变了（%d → %d）': 'File length changed (%d → %d)',
-
-    # 新值
-    '新值': 'New',
-
-    # 无法构造改动
-    '无法构造改动': 'Cannot build the change',
-
+    # 新值 (0-255):
+    '新值 (0-255): ': 'New value (0-255): ',
     # 无法自动定位 Setup 变量块。请用 --setup-of
-    '无法自动定位 Setup 变量块。请用 --setup-offset 手工指定\n  （--setup-offset 要给「长度前缀 + 4」之后的偏移，即 Setup 变量数据的起始位置）': (
-        'Cannot locate the Setup variable block automatically. Pass --setup-offset manually'
-        '\n  (--setup-offset takes the offset *after* the 4-byte length prefix, i.e. where the'
-        ' Setup data starts)'
-    ),
-
-    # 无法解析档案
-    '无法解析档案': 'Cannot parse profile',
-
-    # 无法识别
-    '无法识别': 'Not recognised',
-
+    '无法自动定位 Setup 变量块。请用 --setup-offset 手工指定\n  （--setup-offset 要给「长度前缀 + 4」之后的偏移，即 Setup 变量数据的起始位置）': 'Cannot locate the Setup variable block automatically. Pass --setup-offset manually\n  (--setup-offset takes the offset *after* the 4-byte length prefix, i.e. where the Setup data starts)',
     # 无法识别的字段 %r。可用别名: %s；也可以直接给十六进制
-    '无法识别的字段 %r。可用别名: %s；也可以直接给十六进制偏移（如 0x190）': (
-        'Unrecognised field %r. Aliases: %s; you can also pass a hex offset (e.g. 0x190)'
-    ),
-
+    '无法识别的字段 %r。可用别名: %s；也可以直接给十六进制偏移（如 0x190）': 'Unrecognised field %r. Aliases: %s; you can also pass a hex offset (e.g. 0x190)',
     # 是（⇒ 冻结链）
     '是（⇒ 冻结链）': 'yes (⇒ frozen chain)',
-
     # 显示档案信息 + 已知字段当前值
     '显示档案信息 + 已知字段当前值': 'Show profile info + current values of known fields',
-
     # 未收录也不一定不能用 —— 只要档案结构相同、字段值看着合理
-    '未收录也不一定不能用 —— 只要档案结构相同、字段值看着合理即可。': (
-        'Not being listed does not mean it will not work — as long as the profile layout'
-        ' matches and the field values look sane.'
-    ),
-
-    # 未选择镜像
-    '未选择镜像': 'No image selected',
-
+    '未收录也不一定不能用 —— 只要档案结构相同、字段值看着合理即可。': 'Not being listed does not mean it will not work — as long as the profile layout matches and the field values look sane.',
     # 板型/版本不匹配时工具会打 warning；`info` 也
-    '板型/版本不匹配时工具会打 warning；`info` 也会做一次数值自检': (
-        'On a board/version mismatch the tool prints a warning; `info` also runs a numeric'
-        ' self-check'
-    ),
-
+    '板型/版本不匹配时工具会打 warning；`info` 也会做一次数值自检': 'On a board/version mismatch the tool prints a warning; `info` also runs a numeric self-check',
     # 板型: %r   ← %s
     '板型: %r   ← %s': 'Board: %r   ← %s',
-
     # 板型: %r   ← ⚠ 未收录的板型
     '板型: %r   ← ⚠ 未收录的板型': 'Board: %r   ← ⚠ board not in the known list',
-
     # 板型不匹配：档案板型是 %r，本工具只收录了 %s。
-    '板型不匹配：档案板型是 %r，本工具只收录了 %s。\n    %s': (
-        'Board mismatch: the profile says %r, but this tool only knows %s.'
-        '\n    %s'
-    ),
-
+    '板型不匹配：档案板型是 %r，本工具只收录了 %s。\n    %s': 'Board mismatch: the profile says %r, but this tool only knows %s.\n    %s',
     # 档案体长度: 0x%X (%d)
     '档案体长度: 0x%X (%d)': 'Profile body length: 0x%X (%d)',
-
     # 档案里的 CPU LLC = %s
     '档案里的 CPU LLC = %s': 'CPU LLC in the profile = %s',
-
     # 档案里读不到板型字段（头 32 字节为空）—— 可能不是 A
-    '档案里读不到板型字段（头 32 字节为空）—— 可能不是 ASRock 配置档案。': (
-        'No board field in the profile (the first 32 bytes are empty) — this may not be an'
-        ' ASRock profile.'
-    ),
-
-    # 检测
-    '检测': 'Detect',
-
-    # 检测失败
-    '检测失败': 'Detection failed',
-
+    '档案里读不到板型字段（头 32 字节为空）—— 可能不是 ASRock 配置档案。': 'No board field in the profile (the first 32 bytes are empty) — this may not be an ASRock profile.',
     # 检测失败：未找到 Setup 副本
     '检测失败：未找到 Setup 副本': 'Detection failed: no Setup copy found',
-
     # 检测失败：链尾记录不完整
     '检测失败：链尾记录不完整': 'Detection failed: the tail record is incomplete',
-
     # 检测当前 CPU LLC 是几级（读整片 SPI 镜像）
     '检测当前 CPU LLC 是几级（读整片 SPI 镜像）': 'Detect the current CPU LLC level (reads a full SPI image)',
-
-    # 没有实际改动。
-    '没有实际改动。': 'No actual change.',
-
-    # 没有指定任何要修改的字段。
-    '没有指定任何要修改的字段。': 'No field was specified for modification.',
-
+    # 没有待写入的改动。
+    '没有待写入的改动。': 'Nothing pending.',
     # 没有指定要改什么。用 --llc / --soc-llc /
-    '没有指定要改什么。用 --llc / --soc-llc / --byte，或 -h 看帮助': (
-        'Nothing to change. Use --llc / --soc-llc / --byte, or -h for help'
-    ),
-
-    # 没有改动
-    '没有改动': 'No changes',
-
+    '没有指定要改什么。用 --llc / --soc-llc / --byte，或 -h 看帮助': 'Nothing to change. Use --llc / --soc-llc / --byte, or -h for help',
+    # 没有这个选项。
+    '没有这个选项。': 'No such option.',
+    # 没自动找到档案。可以把文件拖到这个窗口里，或直接粘贴路径。
+    '没自动找到档案。可以把文件拖到这个窗口里，或直接粘贴路径。': 'No profiles found automatically. Drag a file into this window, or paste the path.',
     # 注意
     '注意': 'Note',
-
-    # 添加
-    '添加': 'Add',
-
-    # 清空改动
-    '清空改动': 'Clear changes',
-
-    # 用作基线
-    '用作基线': 'Use as baseline',
-
-    # 用户取消了操作（版型警告）。
-    '用户取消了操作（版型警告）。': 'User cancelled (board warning).',
-
     # 界面/输出语言（默认自动：$ASR_LANG → 终端编码 
-    '界面/输出语言（默认自动：$ASR_LANG → 终端编码 → 系统语言）。写在子命令前后都可以': (
-        'UI/output language (default: auto — $ASR_LANG → terminal encoding → system locale).'
-        ' May be placed before or after the subcommand'
-    ),
-
-    # 界面已切换到新写出档案：%s
-    '界面已切换到新写出档案：%s': 'The UI switched to the newly written profile: %s',
-
-    # 界面语言
-    '界面语言': 'UI language',
-
+    '界面/输出语言（默认自动：$ASR_LANG → 终端编码 → 系统语言）。写在子命令前后都可以': 'UI/output language (default: auto — $ASR_LANG → terminal encoding → system locale). May be placed before or after the subcommand',
+    # 界面已切换到新档案: %s
+    '界面已切换到新档案: %s': 'Now showing the newly written profile: %s',
     # 直接覆盖原文件
     '直接覆盖原文件': 'Overwrite the source file',
-
     # 直接覆盖原文件（强烈建议先备份）
     '直接覆盖原文件（强烈建议先备份）': 'Overwrite the source file (a backup is strongly recommended)',
-
+    # 确定覆盖原档案？输入 YES 确认:
+    '确定覆盖原档案？输入 YES 确认: ': 'Really overwrite the source? Type YES: ',
     # 示例:
-    '示例:\n  asrock_profile                              # 打开图形界面\n  asrock_profile info pbo2-test\n  asrock_profile set  pbo2-test --llc 3\n  asrock_profile set  pbo2-test --soc-llc 5 -o soc5\n  asrock_profile set  pbo2-test --byte 0x1B1=1 --dry-run\n  asrock_profile detect r5.bin --baseline r4.bin\n': (
-        'Examples:'
-        '\n  asrock_profile                              # open the GUI'
-        '\n  asrock_profile info pbo2-test'
-        '\n  asrock_profile set  pbo2-test --llc 3'
-        '\n  asrock_profile set  pbo2-test --soc-llc 5 -o soc5'
-        '\n  asrock_profile set  pbo2-test --byte 0x1B1=1 --dry-run'
-        '\n  asrock_profile detect r5.bin --baseline r4.bin'
-        '\n'
-    ),
-
+    '示例:\n  asrock_profile                              # 显示这份帮助\n  asrock_profile info pbo2-test\n  asrock_profile set  pbo2-test --llc 3\n  asrock_profile set  pbo2-test --soc-llc 5 -o soc5\n  asrock_profile set  pbo2-test --byte 0x1B1=1 --dry-run\n  asrock_profile detect r5.bin --baseline r4.bin\n': 'Examples:\n  asrock_profile                              # show this help\n  asrock_profile info pbo2-test\n  asrock_profile set  pbo2-test --llc 3\n  asrock_profile set  pbo2-test --soc-llc 5 -o soc5\n  asrock_profile set  pbo2-test --byte 0x1B1=1 --dry-run\n  asrock_profile detect r5.bin --baseline r4.bin\n',
     # 符合 DDR4 的 2:1 关系 ✔
     '符合 DDR4 的 2:1 关系 ✔': 'matches the DDR4 2:1 ratio ✔',
-
     # 类型: U 盘配置档案（板型 %r / BIOS %r）
     '类型: U 盘配置档案（板型 %r / BIOS %r）': 'Type: USB config profile (board %r / BIOS %r)',
-
     # 类型: 整片 SPI 镜像
     '类型: 整片 SPI 镜像': 'Type: full SPI image',
-
+    # 编号超出范围
+    '编号超出范围': 'Number out of range',
+    # 自动找到这些档案（新的在前）：
+    '自动找到这些档案（新的在前）：': 'Found these profiles (newest first):',
     # 自动探测命中 %d 个候选；选用偏移最小的：长度前缀 @0x
-    '自动探测命中 %d 个候选；选用偏移最小的：长度前缀 @0x%X、size=0x%X、小字节比例 %.0f%%': (
-        'Auto-detection found %d candidate(s); using the lowest-addressed one: length prefix'
-        ' @0x%X, size=0x%X, small-byte ratio %.0f%%'
-    ),
-
-    # 自定义字节（偏移支持别名或十六进制，如 0x1B1）
-    '自定义字节（偏移支持别名或十六进制，如 0x1B1）': 'Custom byte (an alias or a hex offset, e.g. 0x1B1)',
-
+    '自动探测命中 %d 个候选；选用偏移最小的：长度前缀 @0x%X、size=0x%X、小字节比例 %.0f%%': 'Auto-detection found %d candidate(s); using the lowest-addressed one: length prefix @0x%X, size=0x%X, small-byte ratio %.0f%%',
     # 若 info 显示的 Setup 变量位置不是 0x59、或
-    '若 info 显示的 Setup 变量位置不是 0x59、或自动探测失败，': (
-        'If `info` reports a Setup variable offset other than 0x59, or if auto-detection'
-        ' fails,'
-    ),
-
+    '若 info 显示的 Setup 变量位置不是 0x59、或自动探测失败，': 'If `info` reports a Setup variable offset other than 0x59, or if auto-detection fails,',
     # 要写入的 Setup 原始数据（大小必须完全一致）
     '要写入的 Setup 原始数据（大小必须完全一致）': 'Raw Setup data to write (the size must match exactly)',
-
-    # 覆盖原文件（建议先备份）
-    '覆盖原文件（建议先备份）': 'Overwrite the source file (back it up first)',
-
-    # 解析失败
-    '解析失败': 'Parse failed',
-
-    # 请先打开一个配置档案。
-    '请先打开一个配置档案。': 'Open a profile first.',
-
-    # 请先选择一个 SPI 镜像。
-    '请先选择一个 SPI 镜像。': 'Please choose an SPI image first.',
-
-    # 请先选择一张整片 SPI 镜像（用 AFU 的 /O 备份出
-    '请先选择一张整片 SPI 镜像（用 AFU 的 /O 备份出来的 .bin）。\n也可以直接选一份 U 盘配置档案，但那样只能看到档案里的值。': (
-        "Choose a full SPI image first (a .bin backed up with AFU's /O)."
-        '\nYou may also pick a USB config profile, but then you only see the value stored in'
-        ' the profile.'
-    ),
-
-    # 请同时填写偏移和值。
-    '请同时填写偏移和值。': 'Fill in both the offset and the value.',
-
-    # 请改用命令行模式，例如: %s info <档案>
-    '请改用命令行模式，例如: %s info <档案>\n': (
-        'Use the command line instead, e.g. %s info <profile>'
-        '\n'
-    ),
-
+    # 要设成几级 (0-5):
+    '要设成几级 (0-5): ': 'Level (0-5): ',
+    # 覆盖原档案（危险）
+    '覆盖原档案（危险）': 'OVERWRITE the source profile (dangerous)',
     # 请用 --setup-offset / --setup-si
-    '请用 --setup-offset / --setup-size 手工指定。': (
-        'specify it by hand with --setup-offset / --setup-size.'
-    ),
-
+    '请用 --setup-offset / --setup-size 手工指定。': 'specify it by hand with --setup-offset / --setup-size.',
+    # 请选档案编号，或粘贴完整路径（q 退出）:
+    '请选档案编号，或粘贴完整路径（q 退出）: ': 'Pick a number, or paste a full path (q to quit): ',
     # 读取单个字段
     '读取单个字段': 'Read a single field',
-
-    # 读取失败
-    '读取失败': 'Read failed',
-
-    # 载入: %s（%d 字节，Setup @0x%X size=
-    '载入: %s（%d 字节，Setup @0x%X size=0x%X）': 'Loaded: %s (%d bytes, Setup @0x%X size=0x%X)',
-
-    # 输入不完整
-    '输入不完整': 'Incomplete input',
-
+    # 读取失败: %s
+    '读取失败: %s': 'Read failed: %s',
+    # 输入不是数字: %s
+    '输入不是数字: %s': 'Not a number: %s',
     # 输出文件
     '输出文件': 'Output file',
-
     # 输出文件（默认 <输入>.mod）
     '输出文件（默认 <输入>.mod）': 'Output file (default <input>.mod)',
-
-    # 输出档案另存为
-    '输出档案另存为': 'Save the output profile as',
-
     # 输出路径与输入相同。要覆盖原文件请显式加 --inplace
-    '输出路径与输入相同。要覆盖原文件请显式加 --inplace（建议先备份）': (
-        'Output path equals the input path. To overwrite in place, pass --inplace explicitly'
-        ' (back up first)'
-    ),
-
-    # 还没有载入档案
-    '还没有载入档案': 'No profile loaded',
-
-    # 选择 ASRock 配置档案
-    '选择 ASRock 配置档案': 'Choose an ASRock profile',
-
-    # 选择整片 SPI 镜像（AFU 的 /O 备份产物）
-    '选择整片 SPI 镜像（AFU 的 /O 备份产物）': 'Choose a full SPI image (an AFU /O backup)',
-
-    # 选择镜像…
-    '选择镜像…': 'Choose image…',
-
-    # 重新载入
-    '重新载入': 'Reload',
-
-    # 重新载入失败
-    '重新载入失败': 'Reload failed',
-
+    '输出路径与输入相同。要覆盖原文件请显式加 --inplace（建议先备份）': 'Output path equals the input path. To overwrite in place, pass --inplace explicitly (back up first)',
+    # 退出
+    '退出': 'Exit',
+    # 选操作编号:
+    '选操作编号: ': 'Choose an action: ',
     # 链头(最旧)
     '链头(最旧)': 'head(oldest)',
-
     # 链尾(最新)
     '链尾(最新)': 'tail(newest)',
-
     # 链长
     '链长': 'chain',
-
     # 错误:
     '错误: ': 'Error: ',
-
-    # 错误: 无法加载 GUI（本机 Python 没带 tkin
-    '错误: 无法加载 GUI（本机 Python 没带 tkinter）。\n': (
-        'Error: cannot load the GUI (this Python has no tkinter).'
-        '\n'
-    ),
-
     # 长度前缀位置: 0x%X (%d)
     '长度前缀位置: 0x%X (%d)': 'Length-prefix offset: 0x%X (%d)',
-
     # 顺便跟一份配置档案比对（核对载入的值是否真的生效）
-    '顺便跟一份配置档案比对（核对载入的值是否真的生效）': (
-        'Also compare against a config profile (to check whether the loaded value really took'
-        ' effect)'
-    ),
-
+    '顺便跟一份配置档案比对（核对载入的值是否真的生效）': 'Also compare against a config profile (to check whether the loaded value really took effect)',
     # 顺带把 Setup 原始数据导出到 OUT
     '顺带把 Setup 原始数据导出到 OUT': 'Also export the raw Setup data to OUT',
-
     # 高区 [10]
     '高区 [10]': 'high region [10]',
-
     # （可用 --setup-offset 0x%X --setu
-    '（可用 --setup-offset 0x%X --setup-size 0x%X 把它塞回另一个档案）': (
-        '(use --setup-offset 0x%X --setup-size 0x%X to inject it into another profile)'
-    ),
-
-    # （未检测）
-    '（未检测）': '(not detected)',
-
+    '（可用 --setup-offset 0x%X --setup-size 0x%X 把它塞回另一个档案）': '(use --setup-offset 0x%X --setup-size 0x%X to inject it into another profile)',
     # （用 DRAM Voltage 与 VTT_DDR 的 2:
-    '（用 DRAM Voltage 与 VTT_DDR 的 2:1 关系判断偏移表是否还对得上）。': (
-        '(using the DRAM Voltage vs VTT_DDR 2:1 ratio to tell whether the offset table still'
-        ' lines up).'
-    ),
-
+    '（用 DRAM Voltage 与 VTT_DDR 的 2:1 关系判断偏移表是否还对得上）。': '(using the DRAM Voltage vs VTT_DDR 2:1 ratio to tell whether the offset table still lines up).',
     # ：尺寸不是常见的 0x280，请用 info 核对字段值是否
-    '：尺寸不是常见的 0x280，请用 info 核对字段值是否合理': (
-        ': size is not the usual 0x280 — check the field values with `info`'
-    ),
+    '：尺寸不是常见的 0x280，请用 info 核对字段值是否合理': ': size is not the usual 0x280 — check the field values with `info`',
 }
 
 

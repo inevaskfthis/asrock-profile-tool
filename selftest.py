@@ -10,7 +10,7 @@
   6. dump → inject 往返（恒等）
   7. **版型 / BIOS 版本不匹配 → warning**（新）
   8. **字段自检（DRAM/VTT 2:1）→ warning**（新）
-  9. **GUI 构建与载入冒烟**（新，需要图形环境）
+  9. **端到端：读 → 改 → 写 → 读回**（纯 CLI 路径）
 
 用真实档案：默认 H:/pbo2-test。可用环境变量 ASR_SRC 指定别的。
 """
@@ -18,6 +18,7 @@ import hashlib
 import os
 import re
 import struct
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,6 +28,9 @@ IS_WIN = sys.platform == "win32"
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOL = os.path.join(HERE, 'asrock_profile.py')
 SRC = os.environ.get("ASR_SRC", r"H:/pbo2-test")
+#: 源档案的 sha256 —— 第 9 节用它证明「所有操作都是只读的」
+SRC_SHA = (hashlib.sha256(open(SRC, "rb").read()).hexdigest()
+          if os.path.exists(SRC) else "")
 TMP = tempfile.mkdtemp(prefix="asr_test_")
 
 #: 工具现在会自动探测语言（POSIX 上 LANG=en_US.UTF-8 会选英文），
@@ -91,8 +95,11 @@ def make_synthetic_profile(path):
     return path
 
 
-def check(label, cond):
+def check(label, cond, detail=None):
+    """detail 只在失败时打印（断言信息），成功时不污染输出。"""
     print("      %s %s" % ("✔" if cond else "✘", label))
+    if not cond and detail:
+        print("        -> %s" % detail)
     results.append(bool(cond))
     return cond
 
@@ -226,75 +233,24 @@ check("数值不自洽时报警", "字段自检异常" in r.stdout)
 check("提示不要继续改", "不要继续改写" in r.stdout)
 
 print("=" * 70)
-print("9. GUI 构建冒烟（需要图形环境）")
 print("=" * 70)
-try:
-    import tkinter as tk
-    sys.path.insert(0, HERE)
-    import asrock_profile as M
-
-    check("gui_available() == True", M.gui_available())
-
-    root = tk.Tk()
-    root.withdraw()                                    # 不弹窗
-    app = M.create_gui(root, SRC)
-    root.update()
-
-    check("GUI 载入档案成功", app.p is not None)
-    check("字段表已填充 (%d 行) " % len(app.tree_fields.get_children()),
-          len(app.tree_fields.get_children()) >= 15)
-    check("信息面板非空", len(app.txt_info.get("1.0", "end").strip()) > 40)
-    check("干净档案显示 ✔ 通过", "通过" in app.lbl_warn.cget("text"))
-
-    # 切换到「不匹配板型」的档案，警告标签应变红字
-    app.load_file(bad_board)
-    root.update()
-    check("不匹配板型时警告标签有内容", len(app.lbl_warn.cget("text")) > 20)
-    check("警告文本含板型号", "A9999" in app.lbl_warn.cget("text"))
-
-    # 加载回好档案，测「添加待改动 + 走内部写出通道」
-    app.load_file(SRC)
-    root.update()
-    app.v_off.set("0x1B1")
-    app.v_val.set("1")
-    app.on_add_pending()
-    root.update()
-    check("待改动列表已加入 1 条", len(app.pending) == 1)
-
-    # on_apply 会弹 messagebox，用顶层的假对象替代
-    app.messagebox = _FakeBox()
-    app.v_out.set(os.path.join(TMP, "gui_out"))
-    app.v_dryrun.set(True)
-    app.on_apply()
-    root.update()
-    logtxt = app.txt_log.get("1.0", "end")
-    check("GUI 预览路径产出「将改动的文件字节」", "将改动的文件字节" in logtxt)
-    check("GUI 预览路径未写文件", not os.path.exists(os.path.join(TMP, "gui_out")))
-
-    app.v_dryrun.set(False)
-    app.v_out.set(os.path.join(TMP, "gui_out"))
-    app.load_file(SRC)
-    root.update()
-    app.v_off.set("0x1B1")
-    app.v_val.set("1")
-    app.on_add_pending()
-    app.on_apply()
-    root.update()
-    check("GUI 写出成功", os.path.exists(os.path.join(TMP, "gui_out")))
-    if os.path.exists(os.path.join(TMP, "gui_out")):
-        a = open(SRC, 'rb').read(); b = open(os.path.join(TMP, "gui_out"), 'rb').read()
-        check("GUI 写出只改了 1 字节且长度一致",
-              len(a) == len(b) and sum(1 for i in range(len(a)) if a[i] != b[i]) == 1)
-
-    root.destroy()
-except ImportError:
-    print("      （跳过：本机无 tkinter）")
-except Exception as e:
-    import traceback
-    traceback.print_exc()
-    check("GUI 冒烟未抛异常: %r" % e, False)
-
+print("9. 端到端：读 → 改 → 写 → 读回（纯 CLI 路径）")
 print("=" * 70)
+check("能读到源档案字节", os.path.exists(SRC) and os.path.getsize(SRC) > 0)
+out_e2e = os.path.join(TMP, "e2e_profile")
+results.append(run("set", SRC, "--llc", "3", "-o", out_e2e)[1])
+check("写出文件存在", os.path.exists(out_e2e))
+r, ok = run("get", out_e2e, "cpu-llc"); results.append(ok)
+check("读回 CPU LLC = Level 3", "3 (Level 3)" in (r.stdout or ""))
+# 原始档案必须没被动过
+import hashlib
+check("原始档案 sha256 未变",
+      hashlib.sha256(open(SRC, "rb").read()).hexdigest() == SRC_SHA,
+      "被就地修改了！")
+check("写出的文件长度与源一致",
+      os.path.getsize(out_e2e) == os.path.getsize(SRC))
+
+
 print("10. 源文件未被修改（所有操作都是只读的）")
 print("=" * 70)
 h1 = hashlib.sha256(open(SRC, 'rb').read()).hexdigest()[:32]
@@ -365,46 +321,24 @@ r, ok = run("detect", SRC, "--expect", SRC); results.append(ok)
 check("--expect 自己跟自己 ⇒ 一致", "一致" in r.stdout and "不一致" not in r.stdout)
 
 print("=" * 70)
-print("13. detect 的 GUI 路径")
-print("=" * 70)
-if os.path.exists(R5):
-    try:
-        import tkinter as tk
-        sys.path.insert(0, HERE)
-        import asrock_profile as M
-
-        root = tk.Tk(); root.withdraw()
-        app = M.create_gui(root, SRC)
-        app.messagebox = _FakeBox()
-        app.v_spi.set(R5)
-        app.on_detect()
-        root.update()
-        check("GUI 检测出 Level 3",
-              "Level 3" in app.lbl_detect.cget("text"))
-        check("GUI 日志含链表与结论",
-              "链尾(最新)" in app.txt_log.get("1.0", "end"))
-        root.destroy()
-    except ImportError:
-        print("      （跳过：本机无 tkinter）")
-else:
-    print("  （跳过：未找到 r5.bin）")
-
-print("=" * 70)
-print("14. 跨平台检查")
+print("14. 纯控制台化 / 跨平台检查")
 print("=" * 70)
 sys.path.insert(0, HERE)
 import asrock_profile as M                                        # noqa: E402
+src_text = open(TOOL, encoding="utf-8").read()
 
-check("plat_key() 归一化到三档之一", M.plat_key() in ("win32", "darwin", "linux"))
-for k in ("win32", "darwin", "linux"):
-    check("字体表覆盖 %s（界面 + 等宽）" % k,
-          bool(M.UI_FONT_PREFS.get(k)) and bool(M.MONO_FONT_PREFS.get(k)))
-check("pick_font 命中第一个可用",
-      M.pick_font(["DejaVu Sans", "Noto Sans CJK SC", "X"],
-                  M.UI_FONT_PREFS["linux"], None) == "Noto Sans CJK SC")
-check("pick_font 大小写不敏感",
-      M.pick_font(["consolas"], M.MONO_FONT_PREFS["win32"], None) == "Consolas")
-check("pick_font 全落空时回退", M.pick_font([], M.UI_FONT_PREFS["linux"], "FB") == "FB")
+# 已是纯控制台工具：不该再有 tkinter / GUI 的痕迹
+check("源码里没有 tkinter", "tkinter" not in src_text)
+check("源码里没有 ProfileGUI", "ProfileGUI" not in src_text)
+check("没有残留的 gui 子命令", 'add_parser("gui"' not in src_text)
+check("子命令只有 CLI 那几个",
+      set(M.SUBCOMMANDS) == {"info", "get", "set", "dump", "inject",
+                             "boards", "detect"},
+      str(M.SUBCOMMANDS))
+check("_interactive() 在非 tty 下为 False（不会卡住脚本）",
+      M._interactive() is False)
+r, ok = run("info", SRC); results.append(ok)
+check("拖文件等价于 info（不带子命令也能跑）", "Setup" in (r.stdout or ""))
 
 # 目录当输入 / 当输出 —— POSIX 与 Windows 都会抛 OSError，两边都必须是干净报错
 r, ok = run("info", TMP, expect=1); results.append(ok)
@@ -439,7 +373,6 @@ check("utf-8 终端 ⇒ 不打扰用户", "cannot render" not in txt)
 
 src_text = open(TOOL, encoding="utf-8").read()
 check("没留下裸 os.system（跨平台 shell 差异）", "os.system(" not in src_text)
-check("os.startfile 有平台守卫", "os.startfile" in src_text and IS_WIN is not None)
 
 print("=" * 70)
 print("15. i18n：中英双语")
@@ -514,33 +447,90 @@ M.set_lang("en"); check("set_lang('en') 生效", M.T("文件: %s") == "File: %s"
 M.set_lang("zh"); check("set_lang('zh') 生效", M.T("文件: %s") == "文件: %s")
 M.set_lang("nope"); check("认不出的语言退回自动判断", M.get_lang() in ("zh", "en"))
 
-# ---- 15.5 GUI 切语言 ----
-if os.environ.get("ASR_NO_GUI") != "1":
-    try:
-        import tkinter as tk
-        M.set_lang("zh")
-        root = tk.Tk(); root.withdraw()
-        app = M.create_gui(root, SRC)
-        app.messagebox = _FakeBox()
-        root.update()
-        check("GUI 初始为中文", CJK_RE.search(root.title()) is not None)
-        app.v_lang.set("English"); app.on_lang_change(); root.update()
-        check("GUI 切英文后标题无中文", CJK_RE.search(root.title()) is None)
-        check("GUI 切英文后日志无中文",
-              CJK_RE.search(app.txt_log.get("1.0", "end")) is None)
-        check("GUI 切英文后哨兵文本是英文", app.v_llc.get() == "(no change)")
-        check("GUI 切英文后档位下拉内容也是英文",
-              all(CJK_RE.search(v) is None for v in app._llc_values()))
-        check("GUI 切英文后 _llc_num 仍认得旧值", app._llc_num("(no change)") is None
-              and app._llc_num("Level 3 (3)") == 3)
-        app.v_lang.set("中文"); app.on_lang_change(); root.update()
-        check("GUI 切回中文", CJK_RE.search(root.title()) is not None)
-        root.destroy()
-        M.set_lang("zh")
-    except ImportError:
-        print("      （跳过：本机无 tkinter）")
+# =========================================================================== #
+print("=" * 70)
+print("16. 交互模式（双击 / 拖入时的实际路径）")
+print("=" * 70)
+# 控制台 exe 被双击时，窗口会随进程退出而关闭 —— 用户什么都看不到。
+# 所以「双击 → 选文件 → 列偏移表 → 菜单操作」这条路径必须有测试守住。
+#
+# 驱动方式：_ia_driver.py 用假 tty 包住 stdin/stdout
+# （不依赖 pty/termios —— Windows 上没有这两个模块）。
+
+IA_HOME = os.path.dirname(os.path.abspath(__file__))
+
+
+def drive(script, args=(), lang=None):
+    env = dict(ENV_ZH, IA_HOME=IA_HOME, IA_SCRIPT="|".join(script))
+    env.pop("ASR_LANG", None)
+    if lang:
+        env["ASR_LANG"] = lang
+    r = subprocess.run([PY, os.path.join(IA_HOME, "_ia_driver.py")] + list(args),
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", env=env)
+    return r.stdout + r.stderr
+
+
+# --- 拖入档案 → 直接显示偏移表（不该再问"选哪个文件"）---
+ia1 = drive(["0"], [SRC])
+check("拖入后直接显示偏移表", "当前偏移表" in ia1)
+check("偏移表含 CPU LLC 行", "0x190" in ia1 and "CPU Load-Line" in ia1)
+check("偏移表含 SOC LLC 行", "0x191" in ia1 and "VDDCR_SOC" in ia1)
+check("偏移表含 DRAM/VTT 交叉项", "0x1A8" in ia1 and "0x1A6" in ia1)
+check("显示操作菜单", "操作" in ia1 and "退出" in ia1)
+check("拖入时不再问选文件", "请选档案编号" not in ia1)
+check("正常退出（exit=0）", "再见" in ia1 and "[exit=0]" in ia1)
+
+# --- 双击无参数 → 自动列候选 → 改 LLC → 写出 → 验证字节 ---
+ia_copy = os.path.join(TMP, "ia_src")
+shutil.copyfile(SRC, ia_copy)             # 写出会落到副本上，不碰用户档案
+ia2 = drive([ia_copy, "1", "3", "5", "0"])
+check("双击时列出候选档案", "自动找到" in ia2 or "没自动找到" in ia2 or "请选" in ia2)
+check("选中后显示偏移表", "当前偏移表" in ia2)
+check("菜单 1 项是 CPU LLC", "CPU Load-Line" in ia2)
+check("询问要设成几级", "要设成几级" in ia2)
+check("列出 0=Auto 与 Level 1..5", "Auto" in ia2 and "Level 5" in ia2)
+check("确认加入待写入", "待写入" in ia2)
+check("写出时打印字节级 diff", "diff" in ia2 or "字节级" in ia2)
+check("写完切到新档案", "切换到新档案" in ia2)
+check("正常退出", "再见" in ia2)
+
+# 验证交互模式写出的字节（应与 CLI 的 set 路径完全一致）
+made = [f for f in os.listdir(TMP) if f.startswith("ia_src") and f != "ia_src"]
+if made:
+    out_path = os.path.join(TMP, sorted(made)[0])
+    data = open(out_path, "rb").read()
+    orig = open(ia_copy, "rb").read()
+    diff = [i for i in range(min(len(data), len(orig))) if data[i] != orig[i]]
+    check("交互写出的文件长度一致", len(data) == len(orig))
+    check("交互只改了 1 个字节", len(diff) == 1, "实际 %d 处" % len(diff))
+    if len(diff) == 1:
+        check("改的是 Setup+0x190", diff[0] == 0x59 + 0x190, "0x%X" % diff[0])
+        check("值 = 03 (Level 3)", data[diff[0]] == 3, "%02X" % data[diff[0]])
 else:
-    print("      （跳过：ASR_NO_GUI=1）")
+    check("交互模式产出了输出文件", False, os.listdir(TMP))
+
+# --- 任意字节 / 清空 / 错误输入不崩 ---
+ia3 = drive(["0"], [SRC], )
+ia3 = drive([SRC, "3", "0x1B1", "1", "4", "zzz", "9", "0"])
+check("任意字节加入成功", "已加入待写入" in ia3)
+check("可清空待写入", "已清空" in ia3)
+check("错误输入后程序仍活着", "再见" in ia3)
+
+# --- 英文交互 ---
+ia4 = drive(["0"], [SRC], lang="en")
+check("英文：偏移表标题", "Current values" in ia4)
+check("英文：操作菜单", "Actions" in ia4)
+check("英文：退出提示", "Bye" in ia4)
+
+# --- 非交互终端（管道 / 脚本调用）绝不能进交互，否则会挂死 ---
+r = subprocess.run([PY, TOOL], capture_output=True, text=True,
+                   encoding="utf-8", errors="replace", env=ENV_ZH,
+                   input="", timeout=30)
+check("管道调用不进交互（不会挂死）", "请选档案编号" not in (r.stdout or ""))
+check("管道调用给的是速查", "最常用的四件事" in (r.stdout or ""))
+results.append(r.returncode == 0)
+
 
 print()
 print("=" * 70)

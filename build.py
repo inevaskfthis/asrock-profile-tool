@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""一键打包单文件可执行文件（GUI + CLI 同一个文件）。
+"""一键打包单文件可执行文件（纯命令行工具）。
 
     python build.py
 
 产物：`dist/asrock_profile.exe`（Windows）/ `dist/asrock_profile`（Linux、macOS）
 
 为什么用 --console 而不是 --noconsole：
-一个可执行文件只能绑定一个子系统。CLI 模式必须有 stdout，而 GUI 模式多一个控制台窗口
-只是不好看、不影响功能（那个窗口正好当详细日志看）。反过来用 --noconsole，
-命令行模式会完全没有输出 —— 所以选 --console。
+一个可执行文件只能绑定一个子系统。本工具所有输出都走 stdout，必须 --console；
+用 --noconsole 的话双击连用法速查都看不到。
 
 ⚠ 重新打包前请先退出正在运行的程序：Windows 上文件被占用时删不掉旧的 dist 产物，
   PyInstaller 会失败，而失败信息很容易被 `| tail -3` 吃掉，结果你以为打包成功、
@@ -95,7 +94,7 @@ def main():
                     "（打包前记得先退出正在运行的程序）" % (want, text))
     print("  ✔ 版本自检通过")
     print()
-    print("  双击 / 不带参数  → GUI")
+    print("  双击 / 不带参数  → 交互模式：选档案 → 偏移表 → 菜单")
     print("  带子命令         → CLI，例如  %s info <档案>" % os.path.basename(path))
     return 0
 

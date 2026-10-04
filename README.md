@@ -52,18 +52,60 @@ BIOS: Load User Default from USB →  固件自己把它写回活体变量，并
 ## 依赖
 
 - Python **3.8+**
-- **零第三方依赖**（只用标准库；GUI 用 `tkinter`，Python 官方版自带）
+- **零第三方依赖**（只用标准库，不需要 tkinter）
 - Windows / Linux / macOS 均可
 
 ## 快速开始
 
-### 方式一：图形界面（推荐给不熟命令行的）
+### 双击运行（不熟命令行的）
+
+**双击 `asrock_profile.exe`** → 弹控制台 → 自动扫描常见位置（`H:\`、`C:\`、家目录…）
+列出找到的档案 → 你选一个编号 → 显示**完整偏移表和当前值** → 菜单式改字段。
 
 ```
-asrock_profile            # 不带任何参数 = 打开 GUI
-asrock_profile --gui      # 等价写法
-asrock_profile gui saved_profile   # 启动时直接打开某个档案
+============================================================
+  asrock_profile —— ASRock BIOS 配置档案编辑器
+============================================================
+自动找到这些档案（新的在前）：
+   1) H:\cpullc-L5                          61525 B
+   2) H:\cpullc-L3                          61525 B
+   3) H:\pbo2-test                          61525 B
+   ...
+
+请选档案编号，或粘贴完整路径（q 退出）: 1
+
+✔ 板型 / BIOS 版本 / 字段自检 全部通过
+
+── 当前偏移表 ──
+  偏移       字段                                    当前值
+  ------------------------------------------------------------------
+  0x190     CPU Load-Line Calibration               5 (Level 5)
+  0x191     VDDCR_SOC Load-Line Calibration         3 (Level 3)
+  0x1A6     VTT_DDR (mV)                           650
+  0x1A8     DRAM Voltage (mV)                      1300
+  ...
+  ------------------------------------------------------------------
+  Setup 变量：640 字节 @ 文件偏移 0x59
+
+── 操作 ──
+  1) CPU Load-Line Calibration（防掉压，0=Auto 1..5=Level）
+  2) VDDCR_SOC Load-Line Calibration（0=Auto 1..5=Level）
+  3) 改任意字节（偏移 + 新值）
+  4) 取消所有待写入的改动
+  5) 写出到新文件（不覆盖原档案）
+  6) 覆盖原档案（危险）
+  0) 退出
 ```
+
+选 1 → 输入档位 → 输入 `5` 写出，程序会打印**字节级 diff** 和自检结果，
+然后自动切到新写出的档案，可以接着做下一档。**改完关窗口前它一直在等你。**
+
+**把档案拖到 exe 上**：直接打开那个档案并进同一个菜单（跳过选文件那步）。
+
+> 窗口不会「一闪而过」—— 程序会等你操作或按回车才退出。
+> 在管道 / 脚本里调用时它不会进交互（不会挂死你的自动化），只打印速查。
+
+### 方式一：命令行
 
 界面分六块，从上到下走一遍就行：
 
@@ -102,7 +144,7 @@ asrock_profile inject pbo2-test setup.bin -o newprofile
 asrock_profile detect r5.bin --baseline r4.bin
 ```
 
-> **分发单文件 exe 时**，无参数运行 = 打开 GUI，带子命令 = 命令行。两者同一个文件。
+> **分发单文件 exe 时**：双击 = 打印用法速查并等回车；带子命令 = 正常执行。
 
 ## 语言 / Language
 
@@ -112,7 +154,6 @@ asrock_profile detect r5.bin --baseline r4.bin
 |---|---|
 | 命令行选项 | `asrock_profile --lang en info pbo2-test`（写在子命令前后都行） |
 | 环境变量 | `ASR_LANG=en`（或 `zh`） |
-| GUI | 顶部「界面语言」下拉框 —— **界面立即重建**，已载入的档案、待改动与日志都会保留 |
 | 默认 | 自动判断：`$ASR_LANG` → 终端能不能显示中文 → 系统 locale |
 
 **自动判断的实际效果**：中文 Windows（cp936 控制台）→ 中文；
@@ -122,7 +163,7 @@ asrock_profile detect r5.bin --baseline r4.bin
 
 > 实现：中文是「源语言」，`T()` 在英文模式下查文件末尾的 `EN` 译文表（key 就是那句中文原文）。
 > **漏译的后果只是显示成中文，不会崩。** `selftest.py` 第 15 节会校验
-> 「没有漏译」「没有失效 key」「`%s`/`%d` 占位符逐一对齐」「GUI 切语言后无残留中文」。
+> 「没有漏译」「没有失效 key」「`%s`/`%d` 占位符逐一对齐」「英文模式下全部子命令零漏译」。
 
 ## 检测当前 CPU LLC（读整片 SPI 镜像）
 
@@ -204,7 +245,7 @@ asrock_profile detect r5.bin --expect cpullc-L3   # 顺便核对「我载入的�
 
 | 情况 | 行为 |
 |---|---|
-| 板型不在已知表里 | CLI `info` / `set` 打出 **`[版型警告]`**；GUI 红字提示，**写出前弹窗二次确认** |
+| 板型不在已知表里 | `info` / `set` 打出 **`[板型警告]`**，并解释为什么不能盲改 |
 | 板型对、版本未收录 | 同上（同板型换版本通常兼容，但布局有变的可能） |
 | 板型为空 / 头 32 字节不可打印 | 报 **`[错误]`**，视为不是 ASRock 档案 |
 
@@ -246,7 +287,7 @@ Setup+0x1A6  VTT_DDR (mV)        = 650      ← 应约为上一行的一半
 | `0x262` | SoC/Uncore OC Mode |
 
 LLC 取值：`0` = Auto，`1..5` = Level 1..5。
-任意未知字节也可以用 `--byte 0xNNN=VAL`（GUI 里用"自定义字节"）直接改。
+任意未知字节都可以用 `--byte 0xNNN=VAL` 直接改（可重复，给多个就改多个）。
 
 字段别名：`cpu-llc` / `soc-llc` / `vddcr-soc-voltage` / `vcore-offset` / `vddp` / `vtt-ddr` /
 `dram-voltage` / `vpmm` / `soc-uncore-oc-mode`；也可以直接写十六进制偏移（`0x190`）。
@@ -284,7 +325,7 @@ LLC 取值：`0` = Auto，`1..5` = Level 1..5。
 ## 安全性 / 回滚
 
 - 本工具**只改 U 盘上的一个文件**，不接触 BIOS ROM、不接触闪存芯片。
-- 默认**不覆盖输入文件**（输出为 `<输入>.mod`）；要覆盖请显式 `--inplace` 或勾选 GUI 的选项。
+- 默认**不覆盖输入文件**（输出为 `<输入>.mod`）；要覆盖请显式加 `--inplace`。
 - 每次写出后都会**自动自检**：重新解析输出，确认
   - 文件长度与源文件完全一致
   - **只有**你指定的那些字节发生了变化
@@ -304,11 +345,11 @@ A: 只要你的 BIOS 有 `Save/Load User Default to/from USB flash drive`，且�
 **Q: 会不会把主板搞坏？**
 A: 不会。整个过程不写任何固件区域，最坏情况是"载入了一个不合心意的配置"，再载入别的就行。
 
-**Q: GUI 双击打开时带一个黑色控制台窗口？**
+**Q: 双击 exe 时弹出的控制台窗口是必须的吗？**
 A: 这是刻意的。CLI 模式必须有 stdout，而一个 exe 只能有一个子系统，所以用控制台子系统打包。
 那个黑框正好当详细日志看；不想要的话用下面 `--noconsole` 打包（代价：命令行模式没输出）。
 
-## 打包单文件 exe（GUI + CLI 同一个文件）
+## 打包单文件 exe
 
 ```bash
 # 一键（推荐）
@@ -323,11 +364,11 @@ pyinstaller --onefile --name asrock_profile --console asrock_profile.py
 
 | 运行方式 | 行为 |
 |---|---|
-| 双击 / 不加参数 | 打开图形界面（控制台窗口同时出现，当日志用） |
+| 双击 / 不加参数 | 打印用法速查，等回车关闭（不会一闪而过） |
 | `asrock_profile.exe info x` | 命令行模式 |
 
 > 一个 exe 只能绑定一个子系统，所以这里选 **`--console`**：
-> CLI 必须有 stdout，GUI 反而无所谓多一个黑框。两条路都能用。
+> 纯控制台工具必须有 stdout，所以只能选 `--console`；反正双击时本来就要看到黑框。
 
 ### Windows 控制台编码说明
 
@@ -345,8 +386,6 @@ Windows 的 cmd/PowerShell 默认代码页是 **cp936(GBK)**，而 `⚠ ✔ ✘ 
 |---|---|
 | **控制台编码** | Windows cmd 默认 cp936(GBK)，而 `⚠ ✔ ✘ ⇒ ↔` 不在 GBK 里 —— 直接 `print` 会抛 `UnicodeEncodeError` **把程序打挂**。已内置兼容层：这些符号自动降级成 `[!] [OK] [X] => <->`，中文照常；Git Bash / 管道 / 重定向（UTF-8）时不降级 |
 | **非中文终端** | 终端编码扛不住中文时（典型：英文 Windows 的 cp1252），启动会打一条**英文**提示告诉你怎么办（`chcp 65001` 或 `PYTHONIOENCODING=utf-8`）—— 这条提示本身必须是英文，否则在乱码环境里根本读不了 |
-| **GUI 字体** | 界面全是中文。挑不到带 CJK 字形的字体时，Linux 上会整片显示成豆腐块（□□□），而 Tk 对不存在的字体名是**静默回退**、不报错。已改成按平台候选表逐个核对 `font.families()` 再选：Windows→微软雅黑 / macOS→苹方 / Linux→Noto Sans CJK |
-| **GUI 主题** | Windows `vista` / macOS `aqua` / 其它 `clam` |
 | **红字告警** | macOS 的 aqua 主题会忽略 ttk 的 `foreground`，红字会变黑。所以状态标签用经典 `tk.Label`（所有平台都老实听 `fg=`） |
 | **窗口尺寸** | 按屏幕尺寸夹取并居中 —— 小屏 + HiDPI 缩放下写死 820×680 会超出屏幕 |
 | **打开输出目录** | Windows `os.startfile` / macOS `open` / 其它 `xdg-open`，用 `subprocess` 传**参数列表**（路径含空格也不用管） |
@@ -356,17 +395,18 @@ Windows 的 cmd/PowerShell 默认代码页是 **cp936(GBK)**，而 `⚠ ✔ ✘ 
 
 ### 已知限制
 
-- **输出语言只有中文**。CLI 与 GUI 的文案都没做 i18n；非中文用户目前只能靠上面那条编码提示把中文正确显示出来。
+- ~~输出语言只有中文~~ —— **已解决**：`--lang en` / `$ASR_LANG=en` 即可全英文输出，终端编码扛不住中文时会自动切英文。
   欢迎 PR 加 `--lang en`。
 - **`detect` 不挑平台** —— 它只吃字节。Linux 上 flashrom 读出来的镜像一样能分析。
 - **没在真机 Linux / macOS 上验过**。上面每一条都是按平台 API 差异处理的，
-  逻辑层（解析 / 检测 / 改写）完全与平台无关，但 GUI 的实际观感只在 Windows 上看过。
+  逻辑层（解析 / 检测 / 改写）完全与平台无关。**已无 GUI 依赖**，不需要 tkinter，在任何装了 Python 的机器上都能跑。
 
 ## 目录结构
 
 ```
-asrock_profile.py    主程序 —— CLI + GUI 同一个文件（纯标准库）
-selftest.py          冒烟测试：CLI、板型警告、数值自检、detect、i18n、GUI、GBK 回归
+asrock_profile.py    主程序 —— 纯命令行（纯标准库，不需要 tkinter）
+selftest.py          冒烟测试：CLI、交互模式、板型警告、数值自检、detect、i18n、GBK 回归
+_ia_driver.py        交互模式的测试驱动（假 tty，不依赖 pty/termios）
 build.py             一键 PyInstaller 打包
 HOW-IT-WORKS.md      **实现原理**：为什么菜单里没有却仍有效、为什么读回来这么难判
 analysis/            当初逆向用的分析脚本 + 它们的教训（跑它们要额外的 BIOS 镜像）
@@ -434,18 +474,65 @@ BIOS: Load User Default from USB →  firmware writes it back into the live vari
 ## Requirements
 
 - Python **3.8+**
-- **Zero third-party dependencies** (stdlib only; the GUI uses `tkinter`, bundled with official Python)
+- **Zero third-party dependencies** (stdlib only, no `tkinter` needed)
 - Windows / Linux / macOS
 
 ## Quick start
 
-### GUI
+### Double-click
+
+**Double-click `asrock_profile.exe`** -> a console window opens -> it scans the
+usual places (`H:\`, `C:\`, your home dir) and lists the profiles it found ->
+you pick one by number -> it prints the **full offset table with current
+values** -> you change fields from a menu.
 
 ```
-asrock_profile                  # no arguments = launch the GUI
-asrock_profile --gui            # same thing
-asrock_profile gui saved_profile   # open a profile right away
+============================================================
+  asrock_profile - ASRock BIOS profile editor
+============================================================
+Found these profiles (newest first):
+   1) H:\cpullc-L5                          61525 B
+   2) H:\cpullc-L3                          61525 B
+   3) H:\pbo2-test                          61525 B
+   ...
+
+Pick a number, or paste a full path (q to quit): 1
+
+[OK] board / BIOS version / field self-check all passed
+
+-- Current values --
+  Offset    Field                                    Value
+  ------------------------------------------------------------------
+  0x190     CPU Load-Line Calibration                5 (Level 5)
+  0x191     VDDCR_SOC Load-Line Calibration          3 (Level 3)
+  0x1A6     VTT_DDR (mV)                            650
+  0x1A8     DRAM Voltage (mV)                       1300
+  ...
+  ------------------------------------------------------------------
+  Setup variable: 640 bytes @ file offset 0x59
+
+-- Actions --
+  1) CPU Load-Line Calibration (0=Auto 1..5=Level)
+  2) VDDCR_SOC Load-Line Calibration (0=Auto 1..5=Level)
+  3) Change an arbitrary byte (offset + value)
+  4) Discard all pending changes
+  5) Write to a NEW file (leaves the source alone)
+  6) OVERWRITE the source profile (dangerous)
+  0) Exit
 ```
+
+Pick 1, type a level, then `5` to write. The tool prints a **byte-level diff**
+plus its self-check, then switches to the newly written file so you can keep
+going with the next level. **It stays open until you're done.**
+
+**Dragging a profile onto the exe**: opens that profile straight into the same
+menu (skips the file-picking step).
+
+> The window never flashes away - the tool waits for you (or for Enter).
+> When called from a pipe / script it does **not** enter interactive mode
+> (it would hang your automation); it just prints the cheat-sheet.
+
+### Command line
 
 Six panels, top to bottom:
 
@@ -471,17 +558,16 @@ asrock_profile inject pbo2-test setup.bin -o newprofile
 asrock_profile detect r5.bin --baseline r4.bin        # what CPU LLC is active?
 ```
 
-> When shipped as a single-file exe: no arguments → GUI, subcommand → CLI. Same binary.
+> When shipped as a single-file exe: double-click → usage cheat-sheet, subcommand → normal run.
 
 ## Language / 语言
 
-Both the CLI and the GUI speak **English / 中文**:
+The tool speaks **English / 中文**:
 
 | How | Usage |
 |---|---|
 | Command-line option | `asrock_profile --lang en info pbo2-test` (before *or* after the subcommand) |
 | Environment variable | `ASR_LANG=en` (or `zh`) |
-| GUI | the "UI language" dropdown at the top — it **rebuilds the UI in place**, keeping the loaded profile, pending changes and log |
 | Default | auto: `$ASR_LANG` → can the terminal render Chinese? → system locale |
 
 **What auto-detection means in practice**: a Chinese Windows console (cp936) → Chinese;
@@ -494,7 +580,7 @@ On POSIX, `LC_ALL` / `LANG` are honoured; on Windows they are **deliberately ign
 > in the `EN` catalogue at the end of the file (keyed by the Chinese original).
 > **A missing translation merely shows Chinese — it can never crash.**
 > Section 15 of `selftest.py` verifies "no untranslated strings", "no dead keys",
-> "every `%s`/`%d` placeholder lines up", and "no Chinese left after switching the GUI".
+> "every `%s`/`%d` placeholder lines up", and "no Chinese leaks in English mode".
 
 ## Detecting the active CPU LLC (from a full SPI image)
 
@@ -585,7 +671,7 @@ offsets there is pure guesswork. So the tool **speaks up**:
 
 | Case | Behaviour |
 |---|---|
-| Board not in the known table | CLI `info` / `set` prints **`[版型警告]`**; GUI shows a red warning and **asks for confirmation before writing** |
+| Board not in the known table | `info` / `set` prints a warning explaining why blind edits are unsafe |
 | Board known, version unknown | Same (same board, different version is usually fine, but the layout may have shifted) |
 | Empty board field / non-printable header | Reported as an **error** — treated as "not an ASRock profile" |
 
@@ -627,7 +713,7 @@ Reverse-engineered on **X370 Killer SLI / X370 Gaming K4 10.50** (offsets inside
 | `0x262` | SoC/Uncore OC Mode |
 
 LLC values: `0` = Auto, `1..5` = Level 1..5.
-Any unknown byte can be edited with `--byte 0xNNN=VAL` (use the "custom byte" row in the GUI).
+Any unknown byte can be edited with `--byte 0xNNN=VAL` (repeat the flag to change several at once).
 
 Field aliases: `cpu-llc` / `soc-llc` / `vddcr-soc-voltage` / `vcore-offset` / `vddp` / `vtt-ddr` /
 `dram-voltage` / `vpmm` / `soc-uncore-oc-mode`; a hex offset (`0x190`) also works.
@@ -668,8 +754,8 @@ If detection fails, pass `--setup-offset` / `--setup-size` manually.
 ## Safety / rollback
 
 - The tool **only modifies one file on your USB drive** — it never touches the BIOS ROM or the flash chip.
-- It **never overwrites the input by default** (output is `<input>.mod`); use `--inplace` or the GUI
-  checkbox to overwrite.
+- It **never overwrites the input by default** (output is `<input>.mod`); pass `--inplace`
+  if you really want to overwrite the source file.
 - Every write is followed by an **automatic self-check**: the output is re-parsed to confirm
   - the file length is identical to the source,
   - **only** the bytes you specified changed,
@@ -692,12 +778,12 @@ first). Paste the `info` output into an issue and I'll extend the field table.
 A: No. Nothing firmware-related is written; the worst case is loading a configuration you didn't want,
 and you can simply load a different one.
 
-**Q: Why does the GUI come with a black console window?**
+**Q: Is the black console window on double-click unavoidable?**
 A: By design. CLI mode needs stdout, and an exe can only bind one subsystem, so it's built as a console
 app. That window doubles as the verbose log. If you don't want it, build with `--noconsole` below
 (trade-off: the CLI mode produces no output).
 
-## Building a single-file exe (GUI + CLI in one binary)
+## Building a single-file exe
 
 ```bash
 # one command (recommended)
@@ -712,11 +798,11 @@ Output: `dist/asrock_profile.exe`
 
 | How you run it | Behaviour |
 |---|---|
-| Double-click / no arguments | Opens the GUI (the console window appears too, useful as a log) |
+| Double-click / no arguments | Prints a usage cheat-sheet and waits for Enter (never flashes away) |
 | `asrock_profile.exe info x` | CLI mode |
 
-> One exe can only bind a single subsystem, hence **`--console`**: the CLI needs stdout, while the GUI
-> doesn't mind an extra window. Both paths work.
+> A console tool needs stdout, so `--console` is the only choice. That is fine here: double-click is
+> expected to show a black window anyway.
 
 ### About the Windows console encoding
 
@@ -736,8 +822,6 @@ platform, and what has **already been handled**.
 |---|---|
 | **Console encoding** | Windows cmd defaults to cp936 (GBK), and `⚠ ✔ ✘ ⇒ ↔` are not in GBK — a plain `print` raises `UnicodeEncodeError` and **kills the program**. A compatibility layer degrades those symbols to `[!] [OK] [X] => <->` while Chinese still renders; on Git Bash, pipes or redirection (UTF-8) nothing is degraded |
 | **Non-CJK terminals** | When the terminal encoding cannot represent Chinese (typically cp1252 on an English Windows), a **plain-ASCII English** hint is printed at startup telling you what to do (`chcp 65001` or `PYTHONIOENCODING=utf-8`) — the hint has to be English, otherwise it would be unreadable in exactly the situation that triggers it |
-| **GUI fonts** | The whole UI is Chinese. Without a CJK-capable font it renders as tofu boxes (□□□) on Linux, and Tk **silently falls back** on unknown font names without erroring. The code now checks `font.families()` against a per-platform preference list: Windows→Microsoft YaHei / macOS→PingFang SC / Linux→Noto Sans CJK |
-| **GUI theme** | Windows `vista` / macOS `aqua` / otherwise `clam` |
 | **Coloured warnings** | macOS aqua ignores ttk's `foreground`, turning red warnings black. Status labels therefore use the classic `tk.Label`, which honours `fg=` everywhere |
 | **Window sizing** | Clamped to the screen size and centred — a hard-coded 820×680 overflows small HiDPI laptops |
 | **Opening the output folder** | Windows `os.startfile` / macOS `open` / otherwise `xdg-open`, invoked via `subprocess` with an **argument list** (paths with spaces just work) |
@@ -747,19 +831,20 @@ platform, and what has **already been handled**.
 
 ### Known limitations
 
-- **Output is Chinese only.** Neither the CLI nor the GUI is internationalised; for now non-Chinese users
-  rely on the encoding hint above to display it correctly. PRs adding `--lang en` are welcome.
+- ~~Output was Chinese only~~ — **resolved**: `--lang en` / `$ASR_LANG=en` gives fully English
+  output, and a terminal that cannot render Chinese is auto-detected and switched over.
 - **`detect` is platform-agnostic** — it only eats bytes. An image dumped with flashrom on Linux analyses
   exactly the same way.
-- **Not verified on real Linux / macOS hardware.** Every item above is handled according to the platform
-  API differences, and the logic layer (parsing / detection / patching) is platform-independent, but the
-  GUI has only been visually checked on Windows.
+- **Not verified on real Linux / macOS hardware.** Every item above is handled according to the
+  platform API differences, and the logic layer (parsing / detection / patching) is entirely
+  platform-independent. There is **no GUI dependency**, so it runs anywhere Python does.
 
 ## Project layout
 
 ```
-asrock_profile.py    main program — CLI + GUI in one file (stdlib only)
-selftest.py          smoke tests: CLI, board warnings, sanity check, detect, i18n, GUI, GBK regression
+asrock_profile.py    main program — command line only (stdlib only, no tkinter)
+selftest.py          smoke tests: CLI, interactive mode, board warnings, detect, i18n, GBK regression
+_ia_driver.py        test driver for interactive mode (fake tty, no pty/termios needed)
 build.py             one-command PyInstaller packaging
 HOW-IT-WORKS.md      **implementation notes** — why a hidden field still works, why detection is hard
 analysis/            the reverse-engineering scripts behind the field table, and their lessons
